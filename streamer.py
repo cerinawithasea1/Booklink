@@ -32,6 +32,7 @@ from pathlib import Path
 from urllib.parse import quote, unquote
 import aiohttp
 from aiohttp import web
+from aiohttp.web_log import AccessLogger
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors.rpcerrorlist import FileReferenceExpiredError
@@ -724,6 +725,52 @@ async def precache_in_background(chat_id, message_id, msg, cli, account=ACCOUNT_
         log.warning(f"background precache failed for {chat_id}/{message_id}: {e}")
 
 
+def real_ip(request: web.Request) -> str:
+    """The actual visitor address.
+
+    BookLink sits behind a Cloudflare tunnel, so the socket peer is always the
+    local proxy and %a in the access log is useless. Cloudflare passes the true
+    address in CF-Connecting-IP.
+    """
+    return (
+        request.headers.get("CF-Connecting-IP")
+        or (request.headers.get("X-Forwarded-For", "").split(",")[0].strip())
+        or request.remote
+        or "-"
+    )
+
+
+class DownloadedFileResponse(web.FileResponse):
+    """A file response that only counts as a download once the client took it.
+
+    aiohttp sends a FileResponse body inside prepare(), so a client that drops
+    mid-transfer raises ConnectionResetError out of it and an intact one returns
+    normally. Firing a callback only when prepare() returns therefore fires only
+    for transfers that actually finished — which is the distinction that matters:
+
+    the buzz offload used to fire on the click alone, so a crawler that merely
+    poked at a URL still cost a full download plus a public upload. On 2026-10-07
+    a link crawler produced 476 dropped downloads and every single one of them
+    still queued an upload.
+    """
+
+    def __init__(self, *args, on_download=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_download = on_download
+
+    async def prepare(self, request):
+        result = await super().prepare(request)
+        callback, self._on_download = self._on_download, None
+        # A HEAD carries no body, and a 206 is a ranged seek — neither proves
+        # anybody wanted the whole file, so neither mints a copy.
+        if callback is not None and request.method == "GET" and self.status == 200:
+            try:
+                asyncio.create_task(callback())
+            except Exception as e:
+                log.warning(f"post-download offload hook failed: {e}")
+        return result
+
+
 async def handle_book(request: web.Request):
     if is_crawler(request):
         return web.Response(status=403, text="forbidden")
@@ -767,24 +814,34 @@ async def handle_book(request: web.Request):
             # buzzheavier offload: while a live copy exists, send readers to it
             # (their browser passes Cloudflare; the download also feeds buzz's
             # permanence counter). Never offload group/private ABS material.
+            on_download = None
             if BUZZ_TOKEN and chat_id not in NO_PRECACHE_CHATS:
                 key = _buzz_key(chat_id, message_id, account)
                 ent = _buzz_live(key)
                 if ent:
                     return web.HTTPFound(f"https://buzzheavier.com/{ent['id']}")
                 if time.time() >= (_buzz_map.get(key) or {}).get("retry_after", 0):
-                    # A reader clicked this — real work, but it waits behind
-                    # Cerina's own sends (high=False).
-                    asyncio.create_task(
-                        buzz_offload_task(key, chat_id, message_id, account, cache_file, name, high=False)
-                    )
-            return web.FileResponse(
+                    # Mint the public copy only once the client has actually
+                    # taken the file, behind Cerina's own sends (high=False).
+                    # A click on its own proves nothing — a crawler can click
+                    # anything, and on 2026-10-07 one did exactly that.
+                    who = real_ip(request)
+
+                    def _mint_copy(key=key, who=who):
+                        log.info(f"download completed ({who}) — minting buzz copy for {key}")
+                        return buzz_offload_task(
+                            key, chat_id, message_id, account, cache_file, name, high=False
+                        )
+
+                    on_download = _mint_copy
+            return DownloadedFileResponse(
                 cache_file,
                 headers={
                     "Content-Type": mime,
                     "Content-Disposition": f'attachment; filename="{safe_name}"',
                     "Access-Control-Allow-Origin": "*",
                 },
+                on_download=on_download,
             )
 
     # Slow path: uncached, or cached before sidecars existed — needs Telegram.
@@ -852,26 +909,34 @@ async def handle_book(request: web.Request):
         log.warning(f"meta write failed for {cache_file.name}: {e}")
 
     # buzzheavier offload (same as fast path above).
+    on_download = None
     if BUZZ_TOKEN and chat_id not in NO_PRECACHE_CHATS:
         key = _buzz_key(chat_id, message_id, account)
         ent = _buzz_live(key)
         if ent:
             return web.HTTPFound(f"https://buzzheavier.com/{ent['id']}")
         if time.time() >= (_buzz_map.get(key) or {}).get("retry_after", 0):
-            # Reader-clicked book: low priority, behind her own sends.
-            asyncio.create_task(
-                buzz_offload_task(key, chat_id, message_id, account, cache_file, name, high=False)
-            )
+            # Same rule as the fast path: only once the file is really taken.
+            who = real_ip(request)
+
+            def _mint_copy(key=key, who=who):
+                log.info(f"download completed ({who}) — minting buzz copy for {key}")
+                return buzz_offload_task(
+                    key, chat_id, message_id, account, cache_file, name, high=False
+                )
+
+            on_download = _mint_copy
 
     # Serve the complete cached file. FileResponse handles Range/Content-Length
     # correctly, so no live-stream corruption (the old "Bad Gateway" bug).
-    return web.FileResponse(
+    return DownloadedFileResponse(
         cache_file,
         headers={
             "Content-Type": mime,
             "Content-Disposition": f'attachment; filename="{safe_name}"',
             "Access-Control-Allow-Origin": "*",
         },
+        on_download=on_download,
     )
 
 
@@ -1051,4 +1116,11 @@ def build_app():
 
 
 if __name__ == "__main__":
-    web.run_app(build_app(), host=HOST, port=PORT)
+    # %a is always the local proxy (Cloudflare tunnel), so the real visitor is
+    # only visible via CF-Connecting-IP. Without this the log cannot attribute a
+    # click flood to anybody.
+    web.run_app(
+        build_app(), host=HOST, port=PORT,
+        access_log_class=AccessLogger,
+        access_log_format='%a %t "%r" %s %b "%{Referer}i" "%{User-Agent}i" cf=%{CF-Connecting-IP}i',
+    )

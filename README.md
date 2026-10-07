@@ -181,6 +181,62 @@ lanes:
 Without this, a fresh batch of sends can queue behind hours of reader traffic
 and appear to have silently failed.
 
+### A click is not a download
+
+Minting a public copy is triggered by a *completed download*, not by the request
+that asked for it. The click still serves the file exactly as before — what
+changes is whether a stranger can make you do work by poking a URL.
+
+This exists because a link crawler once walked an entire published catalogue:
+989 requests from one rented server, none of them a real download, and under the
+old behaviour **every single poke still queued a full download and upload**. The
+mechanism is that aiohttp sends a `FileResponse` body *inside* `prepare()`, so a
+client that disconnects mid-transfer raises `ConnectionResetError` out of it and
+one that completes returns normally. Firing the offload only when `prepare()`
+returns therefore fires only for transfers that finished. `HEAD` and ranged
+`206` responses are excluded on purpose: a player seeking around a file is not
+evidence that anybody wanted it.
+
+An aborted click on an *uncached* book still completes its Telegram download,
+because the shared download task is shielded so a second reader does not trigger
+a duplicate. That costs bandwidth, not public copies, and is a deliberate
+trade-off.
+
+## Edge protection (optional)
+
+Anyone can make a link server work by clicking links, and the published links
+are public by design. If that ever gets abused — a crawler, a grudge, a scraper
+walking a forum — the place to stop it is **in front of the origin**, not inside
+the app: blocking at the edge means the traffic never reaches your box.
+
+`edge/edge-guard.js` is a Cloudflare Worker that does two things:
+
+1. Returns a plain **404** for a list of blocked addresses, rather than a 403.
+   This matters for tone as much as security: a 403 announces "you are blocked,
+   come back from another IP", while a 404 is indistinguishable from a dead link
+   and teaches the client nothing.
+2. Rate-limits `/b/` per IP, which is the part that still works after they
+   change address.
+
+Roughly how to wire it up, on a zone that is already proxying:
+
+1. Deploy the Worker (the dashboard's quick-edit is fine, or
+   `wrangler deploy` / `PUT /accounts/{id}/workers/scripts/{name}`).
+2. Add a route. Scope it as tightly as the domain allows — if a whole hostname
+   serves BookLink, `books.example.com/*`; if only the link path does,
+   `example.com/b/*`, so the rest of the domain is untouched.
+3. Leave the Worker's `fetch(request)` passthrough alone. It is what preserves
+   Range requests, seeking and resuming.
+
+Two things that cost an evening to learn:
+
+- **IP Access Rules outrank a Worker route.** If you also block the address at
+  the zone level, that fires first and the client gets the 403 you were trying
+  to avoid. Use one or the other, not both.
+- **A redeployed Worker takes ~10 seconds to reach every edge node**, and during
+  that window some requests still hit the previous version. Verify a change with
+  several spaced requests, or you will conclude a working deploy has failed.
+
 ## Notes
 
 - Files larger than ~2 GB can't be re-uploaded to Telegram by non-premium
@@ -190,6 +246,12 @@ and appear to have silently failed.
   share.
 - Links are permanent *as long as the Telegram message exists*. Deleting the
   message in Telegram is the one thing that breaks a link.
+- The access log records the real visitor address, not the proxy's. Behind a
+  Cloudflare tunnel the socket peer is always `127.0.0.1`, so the log format
+  appends `%{CF-Connecting-IP}i` — without it a click flood cannot be attributed
+  to anyone. Note that `run_app`'s knob is `access_log_format` (a *string*);
+  `access_log` wants a `logging.Logger`, and passing an access-logger instance
+  there yields an app that binds, listens, and never answers.
 
 ## Licence
 
