@@ -1,37 +1,36 @@
 #!/usr/bin/env python3
 """
-BookLink — permanent, shareable streaming links for Telegram files.
+BookLink — permanent, shareable streaming links for Cerina's library.
 
-A link encodes (chat_id, message_id); when opened, a librarian account (an
-admin in the groups whose files you want to share) fetches that message and
-streams the bytes back — with HTTP Range support so audio/video players can
-seek and resume.
+A link encodes (chat_id, message_id); when opened, the librarian account
+(Cerina2, already admin in all her groups) fetches that message and streams
+the bytes — with HTTP Range support so audio players can seek/resume.
 
 Links are permanent: they re-fetch live every time, so nothing expires.
 Files are cached on disk for a short window so seeks/resumes don't re-hit
-Telegram (which throttles GetFileRequest and can make large downloads slow).
+Telegram (which throttles GetFileRequest and made downloads take hours).
 
-The service runs as its OWN Telethon session (a separate "device"), so it never
-conflicts with any other bot or script using the same account.
+Runs as its OWN Telethon session so it never conflicts with fairybot or the
+session-scheduler (same account, separate login = fine, like a second device).
 
-Quick start
------------
-1. Fill in .env (copy .env.example) — you need a Telegram API id/hash and a
-   StringSession for the librarian account.
-2. `python3 make_session.py` to log in and print the session string.
-3. `python3 streamer.py`
-4. Forward a file to the librarian account — it replies with a permanent link.
-
+Built by Uncle Fable with Cerina, July 11 2026. See BOOKLINK_PLAN.md.
 """
 import os
 import time
+import json
 import asyncio
 import base64
 import hmac
+import itertools
+from collections import deque
 import hashlib
 import logging
 import shutil
+import uuid
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote, unquote
+import aiohttp
 from aiohttp import web
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -42,10 +41,10 @@ log = logging.getLogger("booklink")
 
 API_ID = int(os.environ["BOOKLINK_API_ID"])
 API_HASH = os.environ["BOOKLINK_API_HASH"]
-SESSION = os.environ["BOOKLINK_SESSION"]           # StringSession for the librarian account
-SESSION_NEW = os.environ.get("BOOKLINK_SESSION_NEW", "")  # optional: second librarian account for new links
-PORT = int(os.environ.get("BOOKLINK_PORT", "8094"))
-HOST = os.environ.get("BOOKLINK_HOST", "127.0.0.1")  # localhost-only until a reverse proxy/tunnel fronts it
+SESSION = os.environ["BOOKLINK_SESSION"]           # StringSession for Cerina2 (librarian)
+SESSION_NEW = os.environ.get("BOOKLINK_SESSION_NEW", "")  # optional: fresh librarian account for new links
+PORT = int(os.environ.get("BOOKLINK_PORT", "8091"))
+HOST = os.environ.get("BOOKLINK_HOST", "127.0.0.1")  # localhost-only until a tunnel fronts it
 PUBLIC_BASE = os.environ.get("BOOKLINK_BASE", f"http://127.0.0.1:{PORT}")
 LINK_SECRET = os.environ.get("BOOKLINK_SECRET", "")  # optional: signs private links
 
@@ -53,11 +52,309 @@ CACHE_DIR = Path(os.environ.get("BOOKLINK_CACHE_DIR", "/opt/booklink/cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_MAX_AGE = int(os.environ.get("BOOKLINK_CACHE_MAX_AGE", str(24 * 3600)))  # seconds
 CACHE_MAX_SIZE = int(os.environ.get("BOOKLINK_CACHE_MAX_SIZE", str(18 * 1024**3)))  # bytes (18GB hard cap)
-DISK_ALERT_CHAT = os.environ.get("BOOKLINK_ALERT_CHAT", "")  # optional: ping this chat when disk is low
-DISK_ALERT_MB = int(os.environ.get("BOOKLINK_DISK_ALERT_MB", "5120"))  # ping if free drops below this
-DISK_ALERT_COOLDOWN = 24 * 3600  # ping at most once per day
-MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("BOOKLINK_MAX_DOWNLOADS", "1"))
-DOWNLOAD_SEM = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+DISK_ALERT_CHAT = os.environ.get("BOOKLINK_ALERT_CHAT", "cerinawithasea")
+DISK_ALERT_MB = int(os.environ.get("BOOKLINK_DISK_ALERT_MB", "10240"))  # ping if free drops below this
+DISK_ALERT_COOLDOWN = int(os.environ.get("BOOKLINK_DISK_ALERT_COOLDOWN", str(4 * 3600)))  # re-alert at most this often
+MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("BOOKLINK_MAX_DOWNLOADS", "4"))
+# Parachute when Telegram throttles one account's GetFileRequest: set
+# BOOKLINK_DOWNLOAD_VIA=old (or new) to route ALL media fetches/downloads through
+# that account. Links and cache files stay keyed to the account encoded in each
+# /b/ token, so public URLs are never affected — only who does the fetching.
+DOWNLOAD_VIA = os.environ.get("BOOKLINK_DOWNLOAD_VIA", "").strip().lower()
+# Resolved at startup and re-checked by premium_watch_loop. "old"/"new" pins the
+# choice; "auto"/"" lets us pick an account that actually has Telegram Premium.
+_download_via = DOWNLOAD_VIA
+# Group books alternate between the two librarian accounts (see pick_cli_for).
+_group_rr = itertools.cycle(("new", "old"))
+# @Cerina2 is Telegram-throttled: parallel downloads on it just stack flood-waits
+# and keep the account pegged. Run it strictly serial so it can cool down. The
+# fresh account isn't throttled, so it may fetch several books at once.
+DOWNLOAD_SEM_OLD = asyncio.Semaphore(int(os.environ.get("BOOKLINK_MAX_DOWNLOADS_OLD", "1")))
+DOWNLOAD_SEM_NEW = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+
+# One download per cache file, so concurrent clicks on the same uncached link
+# don't each start a full duplicate Telegram download (which floods GetFileRequest).
+_inflight = {}  # cache_file path -> asyncio.Task (single-flight download)
+
+# Chats whose forwards get a link only (no precache). These are the group books the
+# notifier forwards to the librarian — they're a list/database for the ABB, not
+# hot links, so pre-downloading them just wastes Telegram bandwidth and evicts the
+# real (personal) singles from cache. Set to the forwarder->librarian DM id.
+NO_PRECACHE_CHATS = {
+    int(x) for x in os.environ.get("BOOKLINK_NO_PRECACHE_CHATS", "").replace(" ", "").split(",")
+    if x.lstrip("-").isdigit()
+}
+
+# Groups where books are posted so that BOTH librarian accounts can fetch them.
+# A private chat's message IDs differ per account, so a DM book can only ever be
+# downloaded by the account that received it — which is why account-swapping can't
+# speed up personal sends. A GROUP has shared message IDs, so either account can
+# fetch any book posted in it. Posts here are handled like personal sends (link +
+# precache + buzz); they are NOT on the NO_PRECACHE list.
+GROUP_CHATS = {
+    int(x) for x in os.environ.get("BOOKLINK_GROUP_CHATS", "").replace(" ", "").split(",")
+    if x.lstrip("-").isdigit()
+}
+
+FILEBOX_URL = os.environ.get("BOOKLINK_FILEBOX_URL", "http://127.0.0.1:12345")
+
+# --- buzzheavier offload tier (dormant unless BOOKLINK_BUZZ_TOKEN is set) ---
+# Shared personal singles get a background copy uploaded to buzzheavier after they
+# are cached; while that copy is alive, /b/ requests redirect to its landing page.
+# Group books (Book Fairy / ABS, chat in NO_PRECACHE_CHATS) are NEVER offloaded.
+# Telegram stays the source of truth: a dead/expired buzz copy just means we serve
+# locally again, so public links can never break. Token = the account's Auth ID
+# (single Bearer credential, no separate token).
+BUZZ_TOKEN = os.environ.get("BOOKLINK_BUZZ_TOKEN", "")
+BUZZ_DIR = os.environ.get("BOOKLINK_BUZZ_DIR", "")  # buzz folder id to upload into
+BUZZ_MAP_PATH = Path(os.environ.get("BOOKLINK_BUZZ_MAP", "/opt/booklink/buzz_map.json"))
+
+
+class BuzzUploadGate:
+    """One upload at a time, with a fast lane for Cerina's own sends.
+
+    Uploads stay serial because they share the same pipe as the downloads. But
+    the two kinds of upload are not equally urgent: a send-time upload is a book
+    she just posted and is waiting to see, while a click-triggered upload is a
+    reader whose buzz copy had lapsed. On 2026-10-07 a batch of her sends sat
+    behind ~105 reader-triggered uploads and took over an hour to appear — and
+    readers who hit a slow link often don't come back. So sends go first.
+    """
+
+    def __init__(self):
+        self._busy = False
+        self._high = deque()
+        self._low = deque()
+
+    async def acquire(self, high: bool):
+        if not self._busy and not self._high and not self._low:
+            self._busy = True
+            return
+        fut = asyncio.get_running_loop().create_future()
+        (self._high if high else self._low).append(fut)
+        try:
+            await fut
+        except asyncio.CancelledError:
+            if fut.cancelled():
+                self.release()  # hand the slot on rather than lose it
+            raise
+
+    def release(self):
+        # Hand the slot straight to the next waiter, high lane first.
+        for lane in (self._high, self._low):
+            while lane:
+                fut = lane.popleft()
+                if not fut.done():
+                    fut.set_result(None)
+                    return
+        self._busy = False
+
+
+BUZZ_UPLOAD_GATE = BuzzUploadGate()
+_buzz_map = {}  # "chat:msg:account" -> {"id", "expiry", "expiry_epoch", "name"}
+_buzz_lock = asyncio.Lock()
+
+
+def _buzz_load():
+    global _buzz_map
+    if BUZZ_MAP_PATH.is_file():
+        try:
+            _buzz_map = json.loads(BUZZ_MAP_PATH.read_text())
+            log.info(f"buzz map loaded: {len(_buzz_map)} entries")
+        except Exception as e:
+            log.warning(f"buzz map unreadable, starting empty: {e}")
+
+
+def _buzz_save():
+    tmp = BUZZ_MAP_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(_buzz_map, indent=1))
+    os.replace(tmp, BUZZ_MAP_PATH)
+
+
+def _buzz_key(chat_id: int, message_id: int, account: int) -> str:
+    return f"{chat_id}:{message_id}:{account}"
+
+
+def _buzz_live(key: str):
+    """Return the map entry if its buzz copy is (conservatively) still alive."""
+    ent = _buzz_map.get(key)
+    if ent and ent.get("expiry_epoch", 0) > time.time():
+        return ent
+    return None
+
+
+async def _buzz_list_ids():
+    """Every file id in the buzz upload directory, or None if the listing failed."""
+    ids = set()
+    cursor = None
+    pages = 0
+    timeout = aiohttp.ClientTimeout(total=90)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        while True:
+            url = f"https://buzzheavier.com/api/fs/{BUZZ_DIR}"
+            if cursor:
+                url += f"?cursor={cursor}"
+            try:
+                async with s.get(url, headers={"Authorization": f"Bearer {BUZZ_TOKEN}"}) as r:
+                    data = (await r.json(content_type=None)).get("data") or {}
+            except Exception as e:
+                log.warning(f"buzz listing failed: {e}")
+                return None
+            for child in data.get("children") or []:
+                ids.add(child["id"])
+            cursor = data.get("nextCursor")
+            pages += 1
+            if not cursor or pages > 60:
+                break
+    return ids
+
+
+async def buzz_reconcile_loop():
+    """Drop map entries whose buzz copy no longer exists.
+
+    Files get deleted on buzz by hand, but the map would still call them live —
+    so /b/ would redirect a reader to a dead page instead of quietly falling
+    back to Telegram. Reconciling against the real directory listing keeps that
+    redirect honest. A book pruned here simply offloads again if it's clicked."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            if BUZZ_TOKEN and BUZZ_DIR:
+                live = await _buzz_list_ids()
+                if live is not None:
+                    gone = [k for k, v in _buzz_map.items() if v.get("id") and v["id"] not in live]
+                    if gone:
+                        for k in gone:
+                            _buzz_map.pop(k, None)
+                        _buzz_save()
+                        log.info(f"buzz reconcile: dropped {len(gone)} stale entries")
+        except Exception as e:
+            log.warning(f"buzz reconcile error: {e}")
+        await asyncio.sleep(6 * 3600)
+
+
+async def _buzz_existing(session, raw_name: str, size: int):
+    """Return (id, expiry) of a buzz copy we already hold for this exact file.
+
+    Two identical files split the download count between them, which halves the
+    chance either reaches buzz's permanence threshold (15+ downloads in 45 days)
+    — the thing that eventually stops a /b/ link pointing at Telegram. Match on
+    name AND byte size, so a different book that happens to share a filename can
+    never be served in its place. The API also reports each file's live expiry,
+    which can be later than the one we recorded (downloads extend it)."""
+    ids = {v["id"] for v in _buzz_map.values() if v.get("name") == raw_name and v.get("id")}
+    for fid in ids:
+        try:
+            async with session.get(
+                f"https://buzzheavier.com/api/fs/{fid}",
+                headers={"Authorization": f"Bearer {BUZZ_TOKEN}"},
+            ) as r:
+                data = (await r.json(content_type=None)).get("data") or {}
+        except Exception:
+            continue
+        if data.get("size") != size:
+            continue
+        exp = data.get("expiry")
+        if exp:  # a copy that has already lapsed can't serve anyone
+            try:
+                if datetime.fromisoformat(exp.replace("Z", "+00:00")).timestamp() <= time.time():
+                    continue
+            except Exception:
+                pass
+        return data.get("id"), exp
+    return None
+
+
+async def buzz_upload(cache_file: Path, name: str, high: bool = True) -> tuple[str, str | None]:
+    """PUT the cached file to buzzheavier; returns (file_id, expiry ISO or None).
+
+    `high` puts this upload in the fast lane — True for books Cerina just sent,
+    False for reader-click-triggered ones (see BuzzUploadGate)."""
+    raw_name = name
+    name = quote(name)[:500]
+    note = base64.b64encode(name.encode()).decode()
+    base = f"https://w.buzzheavier.com/{BUZZ_DIR}/{name}" if BUZZ_DIR else f"https://w.buzzheavier.com/{name}"
+    await BUZZ_UPLOAD_GATE.acquire(high)
+    try:
+        log.info(f"buzz: uploading {raw_name[:60]} (priority={'send' if high else 'click'})")
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=60)
+        size = cache_file.stat().st_size
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+
+            async def put(url):
+                # aiohttp closes the file object after a request, so each
+                # attempt must open its own handle.
+                with open(cache_file, "rb") as fh:
+                    async with s.put(
+                        url,
+                        data=fh,
+                        headers={"Authorization": f"Bearer {BUZZ_TOKEN}"},
+                    ) as resp:
+                        return resp.status, await resp.json(content_type=None)
+
+            existing = await _buzz_existing(s, raw_name, size)
+            if existing:
+                log.info(f"buzz reuse for {raw_name}")
+                return existing
+
+            status, body = await put(f"{base}?note={note}")
+            if status == 400 and "already exists" in str(body):
+                # A copy exists that we don't know about locally. Look it up
+                # rather than adding a second one; only if that fails do we fall
+                # back to a unique name so the upload still succeeds.
+                existing = await _buzz_existing(s, raw_name, size)
+                if existing:
+                    return existing
+                p = Path(unquote(name))
+                alt = f"{p.stem}__{uuid.uuid4().hex[:6]}{p.suffix}"
+                alt_url = (
+                    f"https://w.buzzheavier.com/{BUZZ_DIR}/{quote(alt)}"
+                    if BUZZ_DIR else f"https://w.buzzheavier.com/{quote(alt)}"
+                )
+                status, body = await put(f"{alt_url}?note={note}")
+            if status not in (200, 201):
+                raise RuntimeError(f"buzz upload {status}: {body}")
+            data = body.get("data") or {}
+            return data["id"], data.get("expiry")
+    finally:
+        BUZZ_UPLOAD_GATE.release()
+
+
+_offload_inflight = set()
+
+
+async def buzz_offload_task(key, chat_id, message_id, account, cache_file, name, high=True):
+    """Upload one book to buzz. `high` = Cerina's own send (see BuzzUploadGate).
+
+    One upload per key at a time, tracked per-key rather than under the global
+    map lock: that lock used to be held across the whole upload, which queued
+    every waiter in arrival order and would have made the priority lanes
+    meaningless.
+    """
+    if key in _offload_inflight or _buzz_live(key):
+        return
+    _offload_inflight.add(key)
+    try:
+        try:
+            fid, expiry = await buzz_upload(cache_file, name, high)
+        except Exception as e:
+            log.warning(f"buzz offload failed for {key}: {e}")
+            async with _buzz_lock:
+                _buzz_map[key] = {"retry_after": time.time() + 3600}
+                _buzz_save()
+            return
+        epoch = 0.0
+        if expiry:
+            try:
+                epoch = datetime.fromisoformat(expiry.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                pass
+        async with _buzz_lock:
+            _buzz_map[key] = {"id": fid, "expiry": expiry, "expiry_epoch": epoch, "name": name}
+            _buzz_save()
+        log.info(f"buzz offloaded {key} -> {fid} (expires {expiry})")
+    finally:
+        _offload_inflight.discard(key)
 
 client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 new_client = None
@@ -66,9 +363,23 @@ if SESSION_NEW:
 
 CHUNK = 512 * 1024  # 512KB stream chunks
 
+# Search/AI crawlers that follow public Mobilism links and download whole m4b files.
+# They generate worthless GetFileRequest load and keep the account throttled.
+_CRAWLER_UAS = (
+    "bingbot", "googlebot", "gptbot", "claudebot", "anthropic-ai",
+    "amazonbot", "duckduckbot", "facebookexternalhit", "slurp",
+    "baiduspider", "yandex", "bytespider", "petalbot", "mj12bot",
+    "semrushbot", "ahrefsbot", "ccbot", "applebot", "perplexitybot",
+)
+
+
+def is_crawler(request: web.Request) -> bool:
+    ua = (request.headers.get("User-Agent") or "").lower()
+    return any(bot in ua for bot in _CRAWLER_UAS)
+
 
 def slug_name(name: str) -> str:
-    """Neat cosmetic URL name: 'Some Author  - A Book Title .m4b' -> 'Some-Author-A-Book-Title.m4b'"""
+    """Neat cosmetic URL name: 'Laura Sims  - How Can I Help You .m4b' → 'Laura-Sims-How-Can-I-Help-You.m4b'"""
     import re as _re
     base, dot, ext = name.rpartition(".")
     if not dot:
@@ -77,8 +388,8 @@ def slug_name(name: str) -> str:
     return f"{s}.{ext}" if ext else s
 
 
-ACCOUNT_OLD = 0  # primary account (legacy links — no version tag in the token)
-ACCOUNT_NEW = 1  # optional second account (token carries a "1" version tag)
+ACCOUNT_OLD = 0  # @Cerina2 (legacy links — no version tag in the token)
+ACCOUNT_NEW = 1  # the fresh account (token carries a "1" version tag)
 
 
 def encode_ref(chat_id: int, message_id: int, account: int = ACCOUNT_OLD) -> str:
@@ -108,8 +419,132 @@ def cache_path(chat_id: int, message_id: int, account: int = ACCOUNT_OLD) -> Pat
     return CACHE_DIR / f"{chat_id}_{message_id}.part"
 
 
+async def _warm_entities(cli):
+    """Populate Telethon's in-memory entity cache so numeric-peer lookups work.
+
+    StringSession does not persist access hashes across restarts, so the first
+    get_messages() for a peer the librarian hasn't heard from since startup
+    fails with "Could not find the input entity". Fetching dialogs once re-caches
+    every known peer (including each forwarder's DM)."""
+    try:
+        dialogs = await cli.get_dialogs()
+        log.info("warmed entity cache: %d dialogs", len(dialogs))
+    except Exception as e:
+        log.warning("entity warm-up failed (links may 500 until the peer re-messages): %s", e)
+
+
+def pick_cli(account):
+    """Client used for Telegram fetches/downloads, honoring the throttle parachute."""
+    if _download_via == "old" and client is not None:
+        return client
+    if _download_via == "new" and new_client is not None:
+        return new_client
+    return new_client if account == ACCOUNT_NEW else client
+
+
+def own_cli(account):
+    """The token account's own client — the only one that sees its private chats."""
+    return new_client if account == ACCOUNT_NEW else client
+
+
+def pick_cli_for(account, chat_id):
+    """Download client for one book. Groups alternate between the two accounts.
+
+    In a group both librarians see the same message IDs, so either can fetch — and
+    since each Premium account has its own throttle, alternating means a batch
+    posted to the group gets worked by TWO pipes instead of one. Personal (private)
+    books are untouched: only the account that received them can fetch those.
+    """
+    if (
+        chat_id in GROUP_CHATS
+        and DOWNLOAD_VIA not in ("old", "new")  # honour an explicit pin
+        and client is not None
+        and new_client is not None
+    ):
+        choice = next(_group_rr)
+        log.info(f"group book {chat_id}: fetching via the {choice} account")
+        return new_client if choice == "new" else client
+    return pick_cli(account)
+
+
+async def _alert(text):
+    """Message Cerina directly. Used for the things that break quietly."""
+    sender = new_client or client
+    try:
+        await sender.send_message(DISK_ALERT_CHAT, text)
+    except Exception as e:
+        log.warning(f"alert send failed: {e}")
+
+
+async def _premium_flags():
+    """{'old': bool, 'new': bool} — Telegram Premium on each librarian account."""
+    flags = {}
+    for label, cli in (("old", client), ("new", new_client)):
+        if cli is None:
+            continue
+        try:
+            me = await cli.get_me()
+            flags[label] = bool(getattr(me, "premium", False))
+        except Exception as e:
+            log.warning(f"premium check failed for {label}: {e}")
+    return flags
+
+
+async def resolve_download_account(initial=False):
+    """Route downloads through an account that actually has Telegram Premium.
+
+    Premium is not cosmetic here. A non-Premium account is throttled so hard that
+    a 300 MB book takes ~20 minutes, and the whole precache -> buzz pipeline backs
+    up behind it. On 2026-09-25 @Cerina2 quietly lost Premium and every download
+    through it collapsed to 72 KB/s — the only visible symptom was books arriving
+    late, and nothing in the pipeline noticed the cause. So we check.
+    """
+    global _download_via
+
+    if DOWNLOAD_VIA in ("old", "new"):
+        # Explicitly pinned. Honour it, but say so if it's the wrong one.
+        _download_via = DOWNLOAD_VIA
+        flags = await _premium_flags()
+        if flags and not flags.get(DOWNLOAD_VIA, False):
+            log.warning(
+                f"BOOKLINK_DOWNLOAD_VIA={DOWNLOAD_VIA} is pinned but that account has no "
+                "Telegram Premium — downloads will be throttled"
+            )
+        return
+
+    flags = await _premium_flags()
+    premium = [k for k in ("new", "old") if flags.get(k)]  # prefer the fresh account
+    if not premium:
+        if flags:
+            log.warning("neither librarian account has Telegram Premium — downloads will be throttled")
+        return
+    if _download_via in premium:
+        return
+    previous, _download_via = _download_via, premium[0]
+    if not initial:
+        log.info(f"download account moved {previous or 'auto'} -> {_download_via} (has Premium)")
+        await _alert(f"⚠️ BookLink: downloads were re-routed to the {_download_via} account — the other one has no Telegram Premium")
+
+
+async def premium_watch_loop():
+    """A Premium lapse costs ~30x download speed and looks like nothing at all."""
+    await asyncio.sleep(600)
+    while True:
+        try:
+            await resolve_download_account()
+        except Exception as e:
+            log.warning(f"premium watch error: {e}")
+        await asyncio.sleep(6 * 3600)
+
+
 async def get_media_message(chat_id, message_id, cli):
-    msg = await cli.get_messages(chat_id, ids=message_id)
+    try:
+        msg = await cli.get_messages(chat_id, ids=message_id)
+    except ValueError as e:
+        # Cold entity cache (e.g. just restarted) — warm once and retry.
+        log.warning("input entity miss for %s; warming cache and retrying: %s", chat_id, e)
+        await _warm_entities(cli)
+        msg = await cli.get_messages(chat_id, ids=message_id)
     if not msg or not msg.media:
         return None
     return msg
@@ -156,20 +591,20 @@ _last_disk_alert = 0.0
 
 
 async def disk_alert_loop():
-    """Ping the configured chat if free disk on / drops too low.
-    Uses the already-connected client, so no second session/token. No-op if
-    BOOKLINK_ALERT_CHAT is not set."""
+    """Ping Cerina if free disk on / drops too low.
+
+    Sent from @lightweavebooks (the pinned librarian account) so it isn't buried
+    like @Cerina2. Falls back to the legacy client if the fresh session is absent."""
     global _last_disk_alert
-    if not DISK_ALERT_CHAT:
-        return
+    sender = new_client or client
     while True:
         try:
             free_mb = shutil.disk_usage("/").free // (1024 * 1024)
             now = time.time()
             if free_mb < DISK_ALERT_MB and now - _last_disk_alert > DISK_ALERT_COOLDOWN:
-                await client.send_message(
+                await sender.send_message(
                     DISK_ALERT_CHAT,
-                    f"⚠️ Low disk: {free_mb} MB free on /",
+                    f"⚠️ Low disk on ready-1986: {free_mb} MB free on /",
                 )
                 _last_disk_alert = now
                 log.info(f"disk alert sent to {DISK_ALERT_CHAT} ({free_mb} MB free)")
@@ -186,27 +621,54 @@ def _rm(path):
 
 
 async def download_to_cache(chat_id, message_id, msg, cli, account=ACCOUNT_OLD):
-    """Download a file fully into cache and return its path. Raises on failure.
-
-    Atomic-rename trick: bytes stream into a hidden `.tmp` file first, then the
-    file is published with a single os.replace(). Because rename is atomic on
-    POSIX, the real filename only ever exists as a *complete* file — a reader
-    can never observe a half-written download (the old "corrupt stream" bug)."""
+    """Download a book fully into cache and return its path. Raises on failure.
+    Used by both the background pre-fetch and the on-demand serve path, so a file
+    is always served from a complete on-disk copy (never streamed live)."""
     cache_file = cache_path(chat_id, message_id, account)
     if cache_file.is_file():
         return cache_file
-    tmp = cache_file.with_suffix(".tmp")
-    async with DOWNLOAD_SEM:
-        if cache_file.is_file():  # another task finished while we waited
-            return cache_file
+
+    # Single-flight per file: repeated clicks / retries on one uncached link must
+    # not each start a full duplicate Telegram download. One shared task per
+    # cache file is what makes that true — a dict of Locks does not, because the
+    # entry is popped while waiters still hold the lock, so after a failure each
+    # arriving request builds a fresh lock and starts yet another full download.
+    # That race filled the download semaphore with duplicate copies of one
+    # popular book and starved send-time precache.
+    task = _inflight.get(cache_file)
+    if task is None or task.done():
+        task = asyncio.ensure_future(
+            _download_once(cache_file, chat_id, message_id, msg, cli, account)
+        )
+        _inflight[cache_file] = task
+        task.add_done_callback(lambda t, cf=cache_file: _inflight_done(cf, t))
+    return await asyncio.shield(task)
+
+
+def _inflight_done(cache_file, task):
+    _inflight.pop(cache_file, None)
+    if not task.cancelled():
+        task.exception()  # mark retrieved; awaiters still get the raise
+
+
+async def _download_once(cache_file, chat_id, message_id, msg, cli, account):
+    tmp = cache_file.with_suffix(f".tmp.{os.getpid()}.{time.time_ns()}")
+    sem = DOWNLOAD_SEM_NEW if cli is new_client else DOWNLOAD_SEM_OLD
+    async with sem:
         media = msg.media
         try:
             with open(tmp, "wb") as fh:
                 async for chunk in cli.iter_download(media, chunk_size=CHUNK):
                     fh.write(chunk)
         except FileReferenceExpiredError:
-            # refresh the file reference once and retry
+            # refresh the file reference once and retry. Under the parachute the
+            # download client may not see this peer (private-chat IDs differ per
+            # account) — then borrow a fresh reference from the token account.
             fresh = await cli.get_messages(chat_id, ids=message_id)
+            if not (fresh and fresh.media):
+                own = own_cli(account)
+                if own is not None and own is not cli:
+                    fresh = await own.get_messages(chat_id, ids=message_id)
             if fresh and fresh.media:
                 media = fresh.media
                 try:
@@ -224,17 +686,47 @@ async def download_to_cache(chat_id, message_id, msg, cli, account=ACCOUNT_OLD):
             raise
         os.replace(tmp, cache_file)
         log.info(f"cached {cache_file.name} ({cache_file.stat().st_size} bytes)")
-        return cache_file
+    return cache_file
 
 
 async def precache_in_background(chat_id, message_id, msg, cli, account=ACCOUNT_OLD):
     try:
+        dcli = pick_cli_for(account, chat_id)
+        if dcli is None:
+            return
+        if dcli is not cli:
+            # Throttle parachute active: refetch the message with the download
+            # account so the media access hash matches the client that reads it.
+            fresh = await get_media_message(chat_id, message_id, dcli)
+            if fresh is not None:
+                msg, cli = fresh, dcli
+            else:
+                # The parachute client can't see this peer (private-chat IDs
+                # differ per account) — download via the token account instead.
+                own = own_cli(account)
+                if own is None:
+                    return
+                msg = await get_media_message(chat_id, message_id, own)
+                if msg is None:
+                    return
+                cli = own
         await download_to_cache(chat_id, message_id, msg, cli, account)
+        # Buzz offload belongs here too: the point of precaching personal sends
+        # is to have copies ready BEFORE anyone clicks, so upload right away
+        # (group chats excluded — they only ever get click-triggered offload).
+        if BUZZ_TOKEN and chat_id not in NO_PRECACHE_CHATS:
+            key = _buzz_key(chat_id, message_id, account)
+            if not _buzz_live(key) and time.time() >= (_buzz_map.get(key) or {}).get("retry_after", 0):
+                name, _, _ = media_info(msg)
+                cache_file = cache_path(chat_id, message_id, account)
+                asyncio.create_task(buzz_offload_task(key, chat_id, message_id, account, cache_file, name))
     except Exception as e:
         log.warning(f"background precache failed for {chat_id}/{message_id}: {e}")
 
 
 async def handle_book(request: web.Request):
+    if is_crawler(request):
+        return web.Response(status=403, text="forbidden")
     token = request.match_info["token"]
 
     if LINK_SECRET:
@@ -247,36 +739,189 @@ async def handle_book(request: web.Request):
     except Exception:
         return web.Response(status=400, text="bad link")
 
-    cli = new_client if account == ACCOUNT_NEW else client
+    cache_file = cache_path(chat_id, message_id, account)
+    meta_file = Path(str(cache_file) + ".meta.json")
+
+    # Buzz BEFORE the local-cache check. The local cache is evicted after 24h
+    # but a buzz copy lives 8 days, so requiring a cached file to reach the
+    # redirect would re-download every book older than a day from Telegram on
+    # every single click. Readers hammering one popular link then keep the
+    # download semaphore full and starve send-time precache, so nothing new
+    # ever reaches buzz. A live buzz copy is a complete answer on its own;
+    # if it's dead or absent we fall through to the cache/Telegram paths.
+    if BUZZ_TOKEN and chat_id not in NO_PRECACHE_CHATS:
+        ent = _buzz_live(_buzz_key(chat_id, message_id, account))
+        if ent:
+            return web.HTTPFound(f"https://buzzheavier.com/{ent['id']}")
+
+    # Fast path: fully cached book with known metadata. Served with NO Telegram
+    # round-trip, so Telegram throttling/outages can never break posted links.
+    if cache_file.is_file() and meta_file.is_file():
+        try:
+            meta = json.loads(meta_file.read_text())
+            name, mime = meta["name"], meta.get("mime", "application/octet-stream")
+        except Exception:
+            name = None
+        if name:
+            safe_name = name.replace('"', "'")
+            # buzzheavier offload: while a live copy exists, send readers to it
+            # (their browser passes Cloudflare; the download also feeds buzz's
+            # permanence counter). Never offload group/private ABS material.
+            if BUZZ_TOKEN and chat_id not in NO_PRECACHE_CHATS:
+                key = _buzz_key(chat_id, message_id, account)
+                ent = _buzz_live(key)
+                if ent:
+                    return web.HTTPFound(f"https://buzzheavier.com/{ent['id']}")
+                if time.time() >= (_buzz_map.get(key) or {}).get("retry_after", 0):
+                    # A reader clicked this — real work, but it waits behind
+                    # Cerina's own sends (high=False).
+                    asyncio.create_task(
+                        buzz_offload_task(key, chat_id, message_id, account, cache_file, name, high=False)
+                    )
+            return web.FileResponse(
+                cache_file,
+                headers={
+                    "Content-Type": mime,
+                    "Content-Disposition": f'attachment; filename="{safe_name}"',
+                    "Access-Control-Allow-Origin": "*",
+                },
+            )
+
+    # Slow path: uncached, or cached before sidecars existed — needs Telegram.
+    cli = pick_cli_for(account, chat_id)
     if cli is None:
-        return web.Response(status=503, text="second librarian account not configured")
+        return web.Response(status=503, text="new librarian account not configured yet")
 
     msg = await get_media_message(chat_id, message_id, cli)
+    if msg is None and own_cli(account) is not cli:
+        # The parachute client can't see this peer: private-chat message IDs
+        # differ per account. Fetch with the token account and borrow its
+        # document for the download client (GetFile works on the document
+        # location); if that download fails we fall back to the token account.
+        own = own_cli(account)
+        if own is not None:
+            msg = await get_media_message(chat_id, message_id, own)
     if msg is None:
         return web.Response(status=404, text="file not found (moved or deleted in Telegram)")
 
     name, size, mime = media_info(msg)
     safe_name = name.replace('"', "'")
-    disposition = f'attachment; filename="{safe_name}"'
 
-    cache_file = cache_path(chat_id, message_id, account)
     if not cache_file.is_file():
+        # Run the download as its own task and shield it: when the reader's
+        # browser gives up (timeout), the handler is cancelled but the download
+        # keeps going, so the next click finds (or waits on) a real cache file.
         try:
-            await download_to_cache(chat_id, message_id, msg, cli, account)
+            dl_task = asyncio.create_task(
+                download_to_cache(chat_id, message_id, msg, cli, account)
+            )
+            try:
+                await asyncio.shield(dl_task)
+            except asyncio.CancelledError:
+                raise  # request cancelled — download continues in background
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            log.error(f"download failed for {chat_id}/{message_id}: {e}")
-            return web.Response(status=502, text="download failed — please try again")
+            own = own_cli(account)
+            if own is None or own is cli:
+                log.error(f"download failed for {chat_id}/{message_id}: {e}")
+                return web.Response(status=502, text="download failed — please try again")
+            log.warning(
+                f"parachute download failed for {chat_id}/{message_id}: {e}; "
+                "falling back to the token account"
+            )
+            own_msg = await get_media_message(chat_id, message_id, own)
+            if own_msg is None:
+                return web.Response(status=404, text="file not found (moved or deleted in Telegram)")
+            name, size, mime = media_info(own_msg)
+            safe_name = name.replace('"', "'")
+            dl_task = asyncio.create_task(
+                download_to_cache(chat_id, message_id, own_msg, own, account)
+            )
+            try:
+                await asyncio.shield(dl_task)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e2:
+                log.error(f"download failed for {chat_id}/{message_id}: {e2}")
+                return web.Response(status=502, text="download failed — please try again")
+
+    try:
+        meta_file.write_text(json.dumps({"name": name, "mime": mime}))
+    except Exception as e:
+        log.warning(f"meta write failed for {cache_file.name}: {e}")
+
+    # buzzheavier offload (same as fast path above).
+    if BUZZ_TOKEN and chat_id not in NO_PRECACHE_CHATS:
+        key = _buzz_key(chat_id, message_id, account)
+        ent = _buzz_live(key)
+        if ent:
+            return web.HTTPFound(f"https://buzzheavier.com/{ent['id']}")
+        if time.time() >= (_buzz_map.get(key) or {}).get("retry_after", 0):
+            # Reader-clicked book: low priority, behind her own sends.
+            asyncio.create_task(
+                buzz_offload_task(key, chat_id, message_id, account, cache_file, name, high=False)
+            )
 
     # Serve the complete cached file. FileResponse handles Range/Content-Length
-    # correctly, so no live-stream corruption.
+    # correctly, so no live-stream corruption (the old "Bad Gateway" bug).
     return web.FileResponse(
         cache_file,
         headers={
             "Content-Type": mime,
-            "Content-Disposition": disposition,
+            "Content-Disposition": f'attachment; filename="{safe_name}"',
             "Access-Control-Allow-Origin": "*",
         },
     )
+
+
+async def handle_download(request: web.Request):
+    """Resolve a FileCodeBox share code and relay it as a plain full download.
+
+    FileCodeBox stays bound to 127.0.0.1 — only this handler is publicly reachable,
+    and it only ever proxies downloads (the upload endpoint is never exposed)."""
+    if is_crawler(request):
+        return web.Response(status=403, text="forbidden")
+    code = request.match_info["code"]
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{FILEBOX_URL}/share/select/",
+                json={"code": code, "password": ""},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    return web.Response(status=404, text="link not found")
+                data = await resp.json()
+                detail = (data or {}).get("detail") or {}
+                name = detail.get("name") or f"{code}.bin"
+                dl = detail.get("download_url")
+                if not dl:
+                    return web.Response(status=404, text="link not found")
+
+            safe_name = name.replace('"', "'")
+            async with session.get(
+                f"{FILEBOX_URL}{dl}",
+                timeout=aiohttp.ClientTimeout(total=None),
+            ) as r:
+                if r.status != 200:
+                    return web.Response(status=502, text="file unavailable")
+                headers = {
+                    "Content-Type": r.headers.get("Content-Type", "application/octet-stream"),
+                    "Content-Disposition": f'attachment; filename="{safe_name}"',
+                    "Access-Control-Allow-Origin": "*",
+                }
+                if r.headers.get("Content-Length"):
+                    headers["Content-Length"] = r.headers["Content-Length"]
+                out = web.StreamResponse(headers=headers)
+                await out.prepare(request)
+                async for chunk in r.content.iter_chunked(CHUNK):
+                    await out.write(chunk)
+                await out.write_eof()
+                return out
+    except Exception as e:
+        log.error(f"download proxy failed for code {code}: {e}")
+        return web.Response(status=502, text="download failed — please try again")
 
 
 async def handle_health(request):
@@ -285,9 +930,18 @@ async def handle_health(request):
     return web.json_response({"ok": True, "me": me, "new": me_new})
 
 
-@events.register(events.NewMessage(incoming=True, func=lambda e: e.is_private and e.media))
+async def handle_robots(request):
+    return web.Response(text="User-agent: *\nDisallow: /\n", content_type="text/plain")
+
+
 async def on_forwarded_book(event):
-    """Forward any file to the librarian account → get its permanent link back."""
+    """Forward any book to a librarian account → get its permanent link back.
+
+    Registered on BOTH clients, but with different filters: the fresh account also
+    accepts the shared group, the legacy one only private chats. That matters —
+    both accounts are members of the group, so if both handled group posts every
+    book would come back with two identical links.
+    """
     try:
         doc = getattr(event.message.media, "document", None)
         if not doc:
@@ -303,35 +957,95 @@ async def on_forwarded_book(event):
         if LINK_SECRET:
             link += f"?s={sign(token)}"
         size_mb = doc.size / 1024 / 1024
-        await event.reply(f"📚 {name or 'file'}\n{size_mb:.1f} MB\n\n🔗 Permanent link:\n{link}")
-        asyncio.create_task(precache_in_background(event.chat_id, event.message.id, event.message, cli, account))
-        log.info(f"link issued for {name} ({event.chat_id}/{event.message.id}, account {account})")
+        await event.reply(
+            f"📚 {name or 'file'}\n{size_mb:.1f} MB\n\n"
+            f"🔗 Permanent link:\n{link}\n\n"
+            f"📋 Easy copy (tap to copy):\n`{link}`",
+            link_preview=False,
+        )
+        # Group books (notifier forwards from the watched group) get a link only — no
+        # precache. They're a list/database for the ABB, not hot public links, so
+        # pre-downloading them just burns Telegram bandwidth and evicts real singles.
+        # Personal singles (Cerina's own forwards) keep the immediate cache.
+        is_group_forward = event.chat_id in NO_PRECACHE_CHATS
+        if not is_group_forward:
+            asyncio.create_task(precache_in_background(event.chat_id, event.message.id, event.message, cli, account))
+        log.info(f"link issued for {name} ({event.chat_id}/{event.message.id}, account {account}, group={is_group_forward})")
     except Exception as e:
         log.error(f"link handler error: {e}")
         await event.reply(f"couldn't make a link: {e}")
 
 
+_seen_unlisted_groups = set()
+
+
+async def on_unlisted_group_media(event):
+    """Say so, once, when media turns up in a group we aren't wired to.
+
+    Otherwise a new group just looks broken — posts land, nothing happens, and
+    there's no trace of why.
+    """
+    if event.chat_id in _seen_unlisted_groups:
+        return
+    _seen_unlisted_groups.add(event.chat_id)
+    title = getattr(event.chat, "title", "") if event.chat else ""
+    log.info(
+        f"media posted in group {event.chat_id} ({title!r}) is NOT handled — "
+        "add it to BOOKLINK_GROUP_CHATS if it should mint links"
+    )
+
+
 async def on_startup(app):
+    _buzz_load()
     await client.start()
-    client.add_event_handler(on_forwarded_book)
+    client.add_event_handler(
+        on_forwarded_book,
+        events.NewMessage(incoming=True, func=lambda e: e.is_private and e.media),
+    )
     if new_client is not None:
         await new_client.start()
-        new_client.add_event_handler(on_forwarded_book)
+        new_client.add_event_handler(
+            on_forwarded_book,
+            events.NewMessage(
+                incoming=True,
+                func=lambda e: e.media and (e.is_private or e.chat_id in GROUP_CHATS),
+            ),
+        )
+        new_client.add_event_handler(
+            on_unlisted_group_media,
+            events.NewMessage(
+                incoming=True,
+                func=lambda e: e.media and not e.is_private and e.chat_id not in GROUP_CHATS,
+            ),
+        )
     asyncio.create_task(cache_cleanup_loop())
     asyncio.create_task(disk_alert_loop())
+    asyncio.create_task(buzz_reconcile_loop())
+    asyncio.create_task(premium_watch_loop())
+    await resolve_download_account(initial=True)
+    flags = await _premium_flags()
+    log.info(
+        f"download account: {_download_via or 'per-book default'} "
+        f"(premium: {', '.join(f'{k}={v}' for k, v in flags.items()) or 'unknown'})"
+    )
     me = await client.get_me()
-    log.info(f"BookLink librarian logged in as @{me.username} (id {me.id}) — forward it a file to get a link")
+    log.info(f"BookLink librarian logged in as @{me.username} (id {me.id}) — forward it a book to get a link")
     if new_client is not None:
         me_new = await new_client.get_me()
-        log.info(f"BookLink second librarian logged in as @{me_new.username} (id {me_new.id})")
+        log.info(f"BookLink new librarian logged in as @{me_new.username} (id {me_new.id})")
+    await _warm_entities(client)
+    if new_client is not None:
+        await _warm_entities(new_client)
 
 
 def build_app():
     app = web.Application()
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/robots.txt", handle_robots)
     app.router.add_get("/b/{token}", handle_book)
     # Pretty form: /b/<key>/Any Book Name.m4b  — the name is cosmetic, the key does the work
     app.router.add_get("/b/{token}/{name:.*}", handle_book)
+    app.router.add_get("/d/{code}", handle_download)
     app.on_startup.append(on_startup)
     return app
 
