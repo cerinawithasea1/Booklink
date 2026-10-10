@@ -70,10 +70,14 @@ DOWNLOAD_VIA = os.environ.get("BOOKLINK_DOWNLOAD_VIA", "").strip().lower()
 _download_via = DOWNLOAD_VIA
 # Group books alternate between the two librarian accounts (see pick_cli_for).
 _group_rr = itertools.cycle(("new", "old"))
-# @Cerina2 is Telegram-throttled: parallel downloads on it just stack flood-waits
-# and keep the account pegged. Run it strictly serial so it can cool down. The
-# fresh account isn't throttled, so it may fetch several books at once.
-DOWNLOAD_SEM_OLD = asyncio.Semaphore(int(os.environ.get("BOOKLINK_MAX_DOWNLOADS_OLD", "1")))
+# How many books each account may fetch at once. The legacy account was run
+# strictly serial for a while because parallel downloads on it stacked flood-waits
+# and kept it pegged — but that was a month when its Premium had lapsed, and the
+# waits stop being a symptom once Premium is back. Both accounts are now on paid
+# Premium, so the two lanes are symmetric by default; drop OLD back to 1 if
+# flood-waits reappear, which is the signal that the lane is the problem.
+DOWNLOAD_SEM_OLD = asyncio.Semaphore(int(os.environ.get("BOOKLINK_MAX_DOWNLOADS_OLD",
+                                                        str(MAX_CONCURRENT_DOWNLOADS))))
 DOWNLOAD_SEM_NEW = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
 # One download per cache file, so concurrent clicks on the same uncached link
