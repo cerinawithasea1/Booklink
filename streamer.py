@@ -109,6 +109,14 @@ INTAKE_CHATS = GROUP_CHATS | NO_PRECACHE_CHATS
 
 FILEBOX_URL = os.environ.get("BOOKLINK_FILEBOX_URL", "http://127.0.0.1:12345")
 
+# The link catalogue. Every link this service mints is reported here so the
+# catalogue fills as books are posted. It used to be filled only by the watcher
+# bridge, which watches a single group, records what it forwards keyed to a DM
+# rather than to the group, and left everything else to quarterly bulk imports —
+# which is why the catalogue drifted and why its live rows were the fragile kind.
+NOTIFY_URL = os.environ.get("BOOKLINK_NOTIFY_URL", "")
+NOTIFY_SECRET = os.environ.get("BOOKLINK_NOTIFY_SECRET", "")
+
 
 class OffloadGate:
     """One upload at a time, with a fast lane for Cerina's own sends.
@@ -756,6 +764,34 @@ async def precache_in_background(chat_id, message_id, msg, cli, account=ACCOUNT_
                 asyncio.create_task(ultra_offload_task(key, chat_id, message_id, account, cache_file, name))
     except Exception as e:
         log.warning(f"background precache failed for {chat_id}/{message_id}: {e}")
+
+
+async def record_in_catalogue(name: str, size: int, link: str) -> None:
+    """Report a link we just handed out, so the catalogue knows about it.
+
+    The catalogue is what the dashboard searches, what `catalogue_link` dedupes
+    against, and what Cerina's library app reads. Recording from here means it
+    fills as books are posted rather than in bulk jobs, and that every row is a
+    link this service actually minted — so a book re-sent later finds its own
+    link again instead of a stranger's.
+
+    Best-effort on purpose: a catalogue that is a bit behind is an annoyance, but
+    a link that fails because the catalogue was unreachable is a breakage.
+    """
+    if not (NOTIFY_URL and NOTIFY_SECRET) or not name or not size:
+        return
+    body = json.dumps({"filename": name, "size": size, "link": link}).encode()
+    sig = hmac.new(NOTIFY_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                NOTIFY_URL, data=body, timeout=aiohttp.ClientTimeout(total=15),
+                headers={"X-Booklink-Signature": sig, "Content-Type": "application/json"},
+            ) as r:
+                if r.status != 200:
+                    log.warning(f"catalogue refused {name!r}: HTTP {r.status}")
+    except Exception as e:
+        log.warning(f"catalogue unreachable, {name!r} not recorded: {e}")
 
 
 async def warm_reused_link(link: str) -> None:
@@ -1440,6 +1476,10 @@ async def on_forwarded_book(event):
         # to the link people will actually open. But it does warm that link, since
         # re-sending a book is a person saying it matters, and the catalogue's copy
         # of it may be sitting in a lane that never keeps copies.
+        # Tell the catalogue about it, whether it was minted or reused: this is
+        # what keeps files.db current, and what makes the next re-send find the
+        # same link.
+        asyncio.create_task(record_in_catalogue(name, doc.size, link))
         is_group_forward = event.chat_id in NO_PRECACHE_CHATS
         if not is_group_forward:
             if reuse:

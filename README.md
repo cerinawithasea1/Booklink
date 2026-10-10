@@ -405,6 +405,25 @@ message would have had, aimed at **the canonical link's own token** rather than
 the new message — one copy on the box, and the link everyone is given is the
 quick one.
 
+### The catalogue fills itself
+
+A link is only half the deliverable; the other half is knowing it exists. The
+catalogue (`files.db`) is what the dashboard searches, what reuse dedupes
+against, and what a library app reads — and filling it used to be a separate
+job. It only grew when a bridge watcher saw a post in the one group it watched,
+forwarded it, and recorded the reply. Everything else arrived in bulk imports
+months apart, which is how a 361,000-book catalogue ended up frozen at a single
+timestamp with nothing feeding it.
+
+So the linker reports its own links. Every `/b/` it hands out — minted or reused
+— is posted to the catalogue's endpoint, signed. The catalogue fills as books are
+posted, and every row is a link this service actually minted, so a book re-sent
+later finds its own link rather than a stranger's.
+
+It is **best-effort by design**: a catalogue that is a little behind is an
+annoyance, but a link that fails because the catalogue was unreachable is a
+breakage. Failures log and move on.
+
 ## Notes
 
 - Files larger than ~2 GB can't be re-uploaded to Telegram by non-premium
