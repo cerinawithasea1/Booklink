@@ -745,6 +745,38 @@ async def precache_in_background(chat_id, message_id, msg, cli, account=ACCOUNT_
         log.warning(f"background precache failed for {chat_id}/{message_id}: {e}")
 
 
+async def warm_reused_link(link: str) -> None:
+    """Give a reused link the send-time treatment the new message would have had.
+
+    Reuse means "this book is already in the catalogue", which is not the same as
+    "this book is already handled". The catalogue's copy of a book often points
+    into a link-only lane — the forwarder DM, usually, because the forwarder saw
+    the book somewhere else first — and those lanes are never pre-cached or
+    offloaded. So handing that link to somebody posting into a lane that keeps
+    copies would mean the book is slow the first time *everyone* opens it, for as
+    long as it exists, which is the opposite of what the fast lane is for.
+
+    Re-sending a book is a person saying it matters, so that overrides where it
+    happens to have been filed. Warm the canonical link itself, so there is still
+    exactly one copy on the box and the link everyone gets is the quick one.
+    """
+    try:
+        token = link.rstrip("/").rsplit("/", 1)[-1].split("?")[0]
+        chat_id, message_id, account = decode_ref(token)
+    except Exception as e:
+        log.warning(f"reused link {link!r} is not a token I can read: {e}")
+        return
+    cli = own_cli(account) or pick_cli_for(account, chat_id)
+    if cli is None:
+        return
+    msg, cli = await get_media_message(chat_id, message_id, cli)
+    if msg is None:
+        log.warning(f"reused link points at {chat_id}/{message_id} but the file is not reachable")
+        return
+    log.info(f"warming the reused link {chat_id}/{message_id} (account {account})")
+    await precache_in_background(chat_id, message_id, msg, cli, account)
+
+
 def real_ip(request: web.Request) -> str:
     """The actual visitor address.
 
@@ -1386,12 +1418,16 @@ async def on_forwarded_book(event):
         # pre-downloading them just burns Telegram bandwidth and evicts real singles.
         # Personal singles (Cerina's own forwards) keep the immediate cache.
         #
-        # A reused link skips this too: the copy belongs to the link people will
-        # actually open, and pre-caching this second message would put a second
-        # copy of one book on the box under a token nobody has.
+        # A reused link doesn't pre-cache *this* message — the copy has to belong
+        # to the link people will actually open. But it does warm that link, since
+        # re-sending a book is a person saying it matters, and the catalogue's copy
+        # of it may be sitting in a lane that never keeps copies.
         is_group_forward = event.chat_id in NO_PRECACHE_CHATS
-        if not is_group_forward and not reuse:
-            asyncio.create_task(precache_in_background(event.chat_id, event.message.id, event.message, cli, account))
+        if not is_group_forward:
+            if reuse:
+                asyncio.create_task(warm_reused_link(reuse))
+            else:
+                asyncio.create_task(precache_in_background(event.chat_id, event.message.id, event.message, cli, account))
         log.info(
             f"link {'reused' if reuse else 'issued'} for {name} "
             f"({event.chat_id}/{event.message.id}, account {account}, group={is_group_forward})"

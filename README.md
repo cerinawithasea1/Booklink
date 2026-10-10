@@ -390,6 +390,21 @@ fetched**. For a private-chat link that means the account it belongs to is still
 present — otherwise the reply would be a dead link where a working new one was
 available, which is worse than the duplicate it was avoiding.
 
+### Reuse warms the link it hands back
+
+"Already in the catalogue" is not the same as "already handled". A book's
+canonical link often points into a **link-only** lane — the forwarder DM,
+usually, because the forwarder saw the book somewhere else first — and those
+lanes are deliberately never pre-cached or offloaded. Handing that link to
+somebody posting into a lane that keeps copies means the book is a cold fetch for
+the first person to open it, and stays that way for as long as the book exists.
+
+Re-sending a book is a person saying it matters, which overrides where it
+happened to be filed. So a reused link gets the send-time treatment the new
+message would have had, aimed at **the canonical link's own token** rather than
+the new message — one copy on the box, and the link everyone is given is the
+quick one.
+
 ## Notes
 
 - Files larger than ~2 GB can't be re-uploaded to Telegram by non-premium
