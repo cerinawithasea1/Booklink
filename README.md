@@ -352,6 +352,44 @@ So logging into the dashboard sets a cookie the guard accepts, and that browser
 is never counted. The cookie is only ever issued by the origin behind the
 dashboard login, and it never travels inside a link.
 
+### Serving a link when one account is gone
+
+A link encodes `chat_id:message_id`, and Telegram scopes messages differently for
+the two kinds of chat:
+
+- **A group shares message ids**, so *either* librarian account can fetch any book
+  posted there. A group link therefore survives losing an account.
+- **A private chat's ids differ per account**, so a DM link can only ever be
+  fetched by the account that received it. Nothing can be done about that — it is
+  Telegram's rule, not a design choice — and those links die with their account.
+
+The tricky part is that the difference isn't visible in the link, so the service
+has to work it out. It fetches with the account the token names, and if that
+fails it retries once with the other account **only when the chat is a group**
+(`chat_id < 0`). A private chat is left to fail fast, because the retry would be
+rejected anyway and a second identical failure says less than the first.
+
+The fetch returns the client that succeeded alongside the message, and the
+download must use that same client: a media reference belongs to the session that
+read it.
+
+### One book, one link
+
+The link catalogue dedupes on filename+size and keeps one entry per book. Left
+there, that isn't quite enough: the bot replies with a freshly minted link first,
+and the catalogue only drops the duplicate afterwards — so a re-forwarded book
+ends up with the recorded link and a stray second one.
+
+So the linker asks the catalogue before minting. It is a single indexed lookup,
+and a hit means the second forward gets the first link back. Reusing a link also
+skips precaching that second message, which would otherwise put a second copy of
+one book on the box under a token nobody has.
+
+One guard matters: a stored link is only handed back **if it could still be
+fetched**. For a private-chat link that means the account it belongs to is still
+present — otherwise the reply would be a dead link where a working new one was
+available, which is worse than the duplicate it was avoiding.
+
 ## Notes
 
 - Files larger than ~2 GB can't be re-uploaded to Telegram by non-premium

@@ -94,24 +94,13 @@ NO_PRECACHE_CHATS = {
 # downloaded by the account that received it — which is why account-swapping can't
 # speed up personal sends. A GROUP has shared message IDs, so either account can
 # fetch any book posted in it. Posts here are handled like personal sends (link +
-# precache + buzz); they are NOT on the NO_PRECACHE list.
+# precache + offload); they are NOT on the NO_PRECACHE list.
 GROUP_CHATS = {
     int(x) for x in os.environ.get("BOOKLINK_GROUP_CHATS", "").replace(" ", "").split(",")
     if x.lstrip("-").isdigit()
 }
 
 FILEBOX_URL = os.environ.get("BOOKLINK_FILEBOX_URL", "http://127.0.0.1:12345")
-
-# --- buzzheavier offload tier (dormant unless BOOKLINK_BUZZ_TOKEN is set) ---
-# Shared personal singles get a background copy uploaded to buzzheavier after they
-# are cached; while that copy is alive, /b/ requests redirect to its landing page.
-# Group books (Book Fairy / ABS, chat in NO_PRECACHE_CHATS) are NEVER offloaded.
-# Telegram stays the source of truth: a dead/expired buzz copy just means we serve
-# locally again, so public links can never break. Token = the account's Auth ID
-# (single Bearer credential, no separate token).
-BUZZ_TOKEN = os.environ.get("BOOKLINK_BUZZ_TOKEN", "")
-BUZZ_DIR = os.environ.get("BOOKLINK_BUZZ_DIR", "")  # buzz folder id to upload into
-BUZZ_MAP_PATH = Path(os.environ.get("BOOKLINK_BUZZ_MAP", "/opt/booklink/buzz_map.json"))
 
 
 class OffloadGate:
@@ -120,9 +109,11 @@ class OffloadGate:
     Uploads stay serial because they share the same pipe as the downloads. But
     the two kinds of upload are not equally urgent: a send-time upload is a book
     she just posted and is waiting to see, while a click-triggered upload is a
-    reader whose buzz copy had lapsed. On 2026-10-07 a batch of her sends sat
-    behind ~105 reader-triggered uploads and took over an hour to appear — and
-    readers who hit a slow link often don't come back. So sends go first.
+    reader who clicked an older link whose copy had lapsed. On 2026-10-07 a batch
+    of her sends sat behind ~105 reader-triggered uploads and took over an hour to
+    appear — and readers who hit a slow link often don't come back. So sends go
+    first, ahead of every queued reader copy, though not ahead of one already
+    running: it is still one upload at a time.
     """
 
     def __init__(self):
@@ -155,219 +146,21 @@ class OffloadGate:
 
 
 OFFLOAD_GATE = OffloadGate()
-_buzz_map = {}  # "chat:msg:account" -> {"id", "expiry", "expiry_epoch", "name"}
-_buzz_lock = asyncio.Lock()
 
 
-def _buzz_load():
-    global _buzz_map
-    if BUZZ_MAP_PATH.is_file():
-        try:
-            _buzz_map = json.loads(BUZZ_MAP_PATH.read_text())
-            log.info(f"buzz map loaded: {len(_buzz_map)} entries")
-        except Exception as e:
-            log.warning(f"buzz map unreadable, starting empty: {e}")
-
-
-def _buzz_save():
-    tmp = BUZZ_MAP_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(_buzz_map, indent=1))
-    os.replace(tmp, BUZZ_MAP_PATH)
-
-
-def _buzz_key(chat_id: int, message_id: int, account: int) -> str:
+def _offload_key(chat_id: int, message_id: int, account: int) -> str:
     return f"{chat_id}:{message_id}:{account}"
 
-
-def _buzz_live(key: str):
-    """Return the map entry if its buzz copy is (conservatively) still alive."""
-    ent = _buzz_map.get(key)
-    if ent and ent.get("expiry_epoch", 0) > time.time():
-        return ent
-    return None
-
-
-async def _buzz_list_ids():
-    """Every file id in the buzz upload directory, or None if the listing failed."""
-    ids = set()
-    cursor = None
-    pages = 0
-    timeout = aiohttp.ClientTimeout(total=90)
-    async with aiohttp.ClientSession(timeout=timeout) as s:
-        while True:
-            url = f"https://buzzheavier.com/api/fs/{BUZZ_DIR}"
-            if cursor:
-                url += f"?cursor={cursor}"
-            try:
-                async with s.get(url, headers={"Authorization": f"Bearer {BUZZ_TOKEN}"}) as r:
-                    data = (await r.json(content_type=None)).get("data") or {}
-            except Exception as e:
-                log.warning(f"buzz listing failed: {e}")
-                return None
-            for child in data.get("children") or []:
-                ids.add(child["id"])
-            cursor = data.get("nextCursor")
-            pages += 1
-            if not cursor or pages > 60:
-                break
-    return ids
-
-
-async def buzz_reconcile_loop():
-    """Drop map entries whose buzz copy no longer exists.
-
-    Files get deleted on buzz by hand, but the map would still call them live —
-    so /b/ would redirect a reader to a dead page instead of quietly falling
-    back to Telegram. Reconciling against the real directory listing keeps that
-    redirect honest. A book pruned here simply offloads again if it's clicked."""
-    await asyncio.sleep(60)
-    while True:
-        try:
-            if BUZZ_TOKEN and BUZZ_DIR:
-                live = await _buzz_list_ids()
-                if live is not None:
-                    gone = [k for k, v in _buzz_map.items() if v.get("id") and v["id"] not in live]
-                    if gone:
-                        for k in gone:
-                            _buzz_map.pop(k, None)
-                        _buzz_save()
-                        log.info(f"buzz reconcile: dropped {len(gone)} stale entries")
-        except Exception as e:
-            log.warning(f"buzz reconcile error: {e}")
-        await asyncio.sleep(6 * 3600)
-
-
-async def _buzz_existing(session, raw_name: str, size: int):
-    """Return (id, expiry) of a buzz copy we already hold for this exact file.
-
-    Two identical files split the download count between them, which halves the
-    chance either reaches buzz's permanence threshold (15+ downloads in 45 days)
-    — the thing that eventually stops a /b/ link pointing at Telegram. Match on
-    name AND byte size, so a different book that happens to share a filename can
-    never be served in its place. The API also reports each file's live expiry,
-    which can be later than the one we recorded (downloads extend it)."""
-    ids = {v["id"] for v in _buzz_map.values() if v.get("name") == raw_name and v.get("id")}
-    for fid in ids:
-        try:
-            async with session.get(
-                f"https://buzzheavier.com/api/fs/{fid}",
-                headers={"Authorization": f"Bearer {BUZZ_TOKEN}"},
-            ) as r:
-                data = (await r.json(content_type=None)).get("data") or {}
-        except Exception:
-            continue
-        if data.get("size") != size:
-            continue
-        exp = data.get("expiry")
-        if exp:  # a copy that has already lapsed can't serve anyone
-            try:
-                if datetime.fromisoformat(exp.replace("Z", "+00:00")).timestamp() <= time.time():
-                    continue
-            except Exception:
-                pass
-        return data.get("id"), exp
-    return None
-
-
-async def buzz_upload(cache_file: Path, name: str, high: bool = True) -> tuple[str, str | None]:
-    """PUT the cached file to buzzheavier; returns (file_id, expiry ISO or None).
-
-    `high` puts this upload in the fast lane — True for books Cerina just sent,
-    False for reader-click-triggered ones (see OffloadGate)."""
-    raw_name = name
-    name = quote(name)[:500]
-    note = base64.b64encode(name.encode()).decode()
-    base = f"https://w.buzzheavier.com/{BUZZ_DIR}/{name}" if BUZZ_DIR else f"https://w.buzzheavier.com/{name}"
-    await OFFLOAD_GATE.acquire(high)
-    try:
-        log.info(f"buzz: uploading {raw_name[:60]} (priority={'send' if high else 'click'})")
-        timeout = aiohttp.ClientTimeout(total=None, sock_connect=60)
-        size = cache_file.stat().st_size
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-
-            async def put(url):
-                # aiohttp closes the file object after a request, so each
-                # attempt must open its own handle.
-                with open(cache_file, "rb") as fh:
-                    async with s.put(
-                        url,
-                        data=fh,
-                        headers={"Authorization": f"Bearer {BUZZ_TOKEN}"},
-                    ) as resp:
-                        return resp.status, await resp.json(content_type=None)
-
-            existing = await _buzz_existing(s, raw_name, size)
-            if existing:
-                log.info(f"buzz reuse for {raw_name}")
-                return existing
-
-            status, body = await put(f"{base}?note={note}")
-            if status == 400 and "already exists" in str(body):
-                # A copy exists that we don't know about locally. Look it up
-                # rather than adding a second one; only if that fails do we fall
-                # back to a unique name so the upload still succeeds.
-                existing = await _buzz_existing(s, raw_name, size)
-                if existing:
-                    return existing
-                p = Path(unquote(name))
-                alt = f"{p.stem}__{uuid.uuid4().hex[:6]}{p.suffix}"
-                alt_url = (
-                    f"https://w.buzzheavier.com/{BUZZ_DIR}/{quote(alt)}"
-                    if BUZZ_DIR else f"https://w.buzzheavier.com/{quote(alt)}"
-                )
-                status, body = await put(f"{alt_url}?note={note}")
-            if status not in (200, 201):
-                raise RuntimeError(f"buzz upload {status}: {body}")
-            data = body.get("data") or {}
-            return data["id"], data.get("expiry")
-    finally:
-        OFFLOAD_GATE.release()
-
-
-_offload_inflight = set()
-
-
-async def buzz_offload_task(key, chat_id, message_id, account, cache_file, name, high=True):
-    """Upload one book to buzz. `high` = Cerina's own send (see OffloadGate).
-
-    One upload per key at a time, tracked per-key rather than under the global
-    map lock: that lock used to be held across the whole upload, which queued
-    every waiter in arrival order and would have made the priority lanes
-    meaningless.
-    """
-    if key in _offload_inflight or _buzz_live(key):
-        return
-    _offload_inflight.add(key)
-    try:
-        try:
-            fid, expiry = await buzz_upload(cache_file, name, high)
-        except Exception as e:
-            log.warning(f"buzz offload failed for {key}: {e}")
-            async with _buzz_lock:
-                _buzz_map[key] = {"retry_after": time.time() + 3600}
-                _buzz_save()
-            return
-        epoch = 0.0
-        if expiry:
-            try:
-                epoch = datetime.fromisoformat(expiry.replace("Z", "+00:00")).timestamp()
-            except Exception:
-                pass
-        async with _buzz_lock:
-            _buzz_map[key] = {"id": fid, "expiry": expiry, "expiry_epoch": epoch, "name": name}
-            _buzz_save()
-        log.info(f"buzz offloaded {key} -> {fid} (expires {expiry})")
-    finally:
-        _offload_inflight.discard(key)
 
 # ---------------------------------------------------------------------------
 # Public offload tier — the seeding box
 #
 # Replaces buzzheavier, disabled 2026-10-10 after its ad-funded landing page
 # served a reader a macOS infostealer lure. The public copy now goes to Cerina's
-# own seeding box, whose nginx serves static files openly from ~/www/books (the
-# auth there covers only PHP and WebDAV). A book becomes a copy over SSH with a
-# dedicated key, so the reader's path contains no third party and no ads at all.
+# own seeding box, over SSH with a dedicated key, so the reader's path contains
+# no third party and no ads at all. Two settings there are load-bearing: nginx
+# must force Content-Disposition (the browser acts on the redirect target, not on
+# the /b/ response) and must not list the directory.
 #
 # Telegram stays the source of truth exactly as before: if the box is full,
 # unreachable, or the copy is deleted, /b/ simply serves locally again.
@@ -548,6 +341,47 @@ def decode_ref(token: str):
     raise ValueError("bad link")
 
 
+def catalogue_link(name: str, size: int) -> str | None:
+    """The link already recorded for this exact file, if we could still serve it.
+
+    The bridge records one link per book, keyed on filename+size, and refuses to
+    record a second. But it can only drop the duplicate *after* the fact — by then
+    the bot has already replied with a freshly minted link, so a re-forwarded book
+    ends up with a canonical link in the catalogue and a stray one in the chat.
+    Asking the catalogue first means the second forward just gets the first link
+    back, which is what everyone already assumes is happening.
+
+    Indexed on (filename, size), so this is a single lookup rather than a scan.
+    """
+    if not (FILES_DB and Path(FILES_DB).is_file()):
+        return None
+    try:
+        con = sqlite3.connect(f"file:{FILES_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            row = con.execute(
+                "SELECT stored FROM files WHERE filename = ? AND size = ? LIMIT 1",
+                (name, size),
+            ).fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        log.warning(f"catalogue lookup failed: {e}")
+        return None
+    if not row or not row[0]:
+        return None
+    stored = row[0]
+    try:
+        chat_id, _, account = decode_ref(stored.rsplit("/", 1)[-1].split("?")[0])
+    except Exception:
+        return None
+    # A link we could no longer fetch would be worse than a new one: the whole
+    # point is that the reply works. Private chats are bound to the account that
+    # received them, so hand back that link only while that account is still here.
+    if chat_id > 0 and own_cli(account) is None:
+        return None
+    return stored
+
+
 def sign(token: str) -> str:
     return hmac.new(LINK_SECRET.encode(), token.encode(), hashlib.sha256).hexdigest()[:16]
 
@@ -633,7 +467,7 @@ async def resolve_download_account(initial=False):
     """Route downloads through an account that actually has Telegram Premium.
 
     Premium is not cosmetic here. A non-Premium account is throttled so hard that
-    a 300 MB book takes ~20 minutes, and the whole precache -> buzz pipeline backs
+    a 300 MB book takes ~20 minutes, and the whole precache -> offload pipeline backs
     up behind it. On 2026-09-25 @Cerina2 quietly lost Premium and every download
     through it collapsed to 72 KB/s — the only visible symptom was books arriving
     late, and nothing in the pipeline noticed the cause. So we check.
@@ -676,17 +510,66 @@ async def premium_watch_loop():
         await asyncio.sleep(6 * 3600)
 
 
-async def get_media_message(chat_id, message_id, cli):
+def other_cli(cli):
+    """The other librarian client, when there are two and they differ."""
+    if client is None or new_client is None or cli is None:
+        return None
+    if cli is client:
+        return new_client
+    if cli is new_client:
+        return client
+    return None
+
+
+async def _fetch_once(chat_id, message_id, cli):
     try:
-        msg = await cli.get_messages(chat_id, ids=message_id)
+        return await cli.get_messages(chat_id, ids=message_id)
     except ValueError as e:
         # Cold entity cache (e.g. just restarted) — warm once and retry.
         log.warning("input entity miss for %s; warming cache and retrying: %s", chat_id, e)
         await _warm_entities(cli)
-        msg = await cli.get_messages(chat_id, ids=message_id)
+        return await cli.get_messages(chat_id, ids=message_id)
+
+
+async def get_media_message(chat_id, message_id, cli):
+    """Fetch a book's message, falling back to the other account for a group.
+
+    Returns (message, client_used) — the caller must fetch the *bytes* with the
+    same client, because the media reference belongs to the session that read it.
+
+    The fallback exists because of how Telegram scopes messages. A private chat's
+    message ids differ per account, so a DM link can only ever be fetched by the
+    account that received it and no second account can help. A group shares
+    message ids, so either librarian can fetch it — which means a group link can
+    survive losing an account. Until now it only survived if somebody noticed and
+    flipped BOOKLINK_DOWNLOAD_VIA by hand, which is a bad thing to have to
+    remember at the worst possible moment.
+
+    A private chat is left alone on purpose: the retry would be rejected, and
+    failing fast says more than a second identical failure.
+    """
+    msg, err = None, None
+    try:
+        msg = await _fetch_once(chat_id, message_id, cli)
+    except Exception as e:
+        err = e
+        log.warning("fetch %s/%s failed on this account: %s", chat_id, message_id, e)
+
     if not msg or not msg.media:
-        return None
-    return msg
+        alt_cli = other_cli(cli) if chat_id < 0 else None
+        if alt_cli is not None:
+            try:
+                alt = await _fetch_once(chat_id, message_id, alt_cli)
+            except Exception as e:
+                err = err or e
+                alt = None
+            if alt is not None and alt.media:
+                log.info("fetch %s/%s recovered via the other account", chat_id, message_id)
+                return alt, alt_cli
+        if err is not None:
+            raise err
+
+    return msg, cli
 
 
 def media_info(msg):
@@ -836,25 +719,24 @@ async def precache_in_background(chat_id, message_id, msg, cli, account=ACCOUNT_
         if dcli is not cli:
             # Throttle parachute active: refetch the message with the download
             # account so the media access hash matches the client that reads it.
-            fresh = await get_media_message(chat_id, message_id, dcli)
+            fresh, fcli = await get_media_message(chat_id, message_id, dcli)
             if fresh is not None:
-                msg, cli = fresh, dcli
+                msg, cli = fresh, fcli
             else:
                 # The parachute client can't see this peer (private-chat IDs
                 # differ per account) — download via the token account instead.
                 own = own_cli(account)
                 if own is None:
                     return
-                msg = await get_media_message(chat_id, message_id, own)
+                msg, cli = await get_media_message(chat_id, message_id, own)
                 if msg is None:
                     return
-                cli = own
         await download_to_cache(chat_id, message_id, msg, cli, account)
         # The public copy belongs here too: the point of precaching personal sends
         # is to have copies ready BEFORE anyone clicks, so copy right away
         # (link-only chats excluded — they only ever get click-triggered offload).
         if ULTRA_ENABLED and chat_id not in NO_PRECACHE_CHATS:
-            key = _buzz_key(chat_id, message_id, account)
+            key = _offload_key(chat_id, message_id, account)
             if not _ultra_live(key) and time.time() >= (_ultra_map.get(key) or {}).get("retry_after", 0):
                 name, _, _ = media_info(msg)
                 cache_file = cache_path(chat_id, message_id, account)
@@ -886,7 +768,7 @@ class DownloadedFileResponse(web.FileResponse):
     normally. Firing a callback only when prepare() returns therefore fires only
     for transfers that actually finished — which is the distinction that matters:
 
-    the buzz offload used to fire on the click alone, so a crawler that merely
+    the offload used to fire on the click alone, so a crawler that merely
     poked at a URL still cost a full download plus a public upload. On 2026-10-07
     a link crawler produced 476 dropped downloads and every single one of them
     still queued an upload.
@@ -934,7 +816,7 @@ async def handle_book(request: web.Request):
     # then keep the download semaphore full. A copy on the box is a complete
     # answer on its own; if it's absent we fall through to cache/Telegram.
     if ULTRA_ENABLED and chat_id not in NO_PRECACHE_CHATS:
-        key = _buzz_key(chat_id, message_id, account)
+        key = _offload_key(chat_id, message_id, account)
         ent = _ultra_live(key)
         if ent:
             # Only GETs count as a reader: players and link-preview bots send
@@ -959,7 +841,7 @@ async def handle_book(request: web.Request):
             # link-only chats.
             on_download = None
             if ULTRA_ENABLED and chat_id not in NO_PRECACHE_CHATS:
-                key = _buzz_key(chat_id, message_id, account)
+                key = _offload_key(chat_id, message_id, account)
                 ent = _ultra_live(key)
                 if ent:
                     if request.method == "GET":
@@ -994,7 +876,7 @@ async def handle_book(request: web.Request):
     if cli is None:
         return web.Response(status=503, text="new librarian account not configured yet")
 
-    msg = await get_media_message(chat_id, message_id, cli)
+    msg, cli = await get_media_message(chat_id, message_id, cli)
     if msg is None and own_cli(account) is not cli:
         # The parachute client can't see this peer: private-chat message IDs
         # differ per account. Fetch with the token account and borrow its
@@ -1002,7 +884,7 @@ async def handle_book(request: web.Request):
         # location); if that download fails we fall back to the token account.
         own = own_cli(account)
         if own is not None:
-            msg = await get_media_message(chat_id, message_id, own)
+            msg, cli = await get_media_message(chat_id, message_id, own)
     if msg is None:
         return web.Response(status=404, text="file not found (moved or deleted in Telegram)")
 
@@ -1032,7 +914,7 @@ async def handle_book(request: web.Request):
                 f"parachute download failed for {chat_id}/{message_id}: {e}; "
                 "falling back to the token account"
             )
-            own_msg = await get_media_message(chat_id, message_id, own)
+            own_msg, own = await get_media_message(chat_id, message_id, own)
             if own_msg is None:
                 return web.Response(status=404, text="file not found (moved or deleted in Telegram)")
             name, size, mime = media_info(own_msg)
@@ -1056,7 +938,7 @@ async def handle_book(request: web.Request):
     # Public offload (same rule as the fast path above).
     on_download = None
     if ULTRA_ENABLED and chat_id not in NO_PRECACHE_CHATS:
-        key = _buzz_key(chat_id, message_id, account)
+        key = _offload_key(chat_id, message_id, account)
         ent = _ultra_live(key)
         if ent:
             if request.method == "GET":
@@ -1482,10 +1364,16 @@ async def on_forwarded_book(event):
         for a in doc.attributes:
             if hasattr(a, "file_name") and a.file_name:
                 name = a.file_name
-        token = encode_ref(event.chat_id, event.message.id, account)
-        link = f"{PUBLIC_BASE}/b/{token}"
-        if LINK_SECRET:
-            link += f"?s={sign(token)}"
+        # A signed link can't be reused: the signature is over the token, and a
+        # stored one was written without it.
+        reuse = None if LINK_SECRET else (catalogue_link(name, doc.size) if name else None)
+        if reuse:
+            link = reuse
+        else:
+            token = encode_ref(event.chat_id, event.message.id, account)
+            link = f"{PUBLIC_BASE}/b/{token}"
+            if LINK_SECRET:
+                link += f"?s={sign(token)}"
         size_mb = doc.size / 1024 / 1024
         await event.reply(
             f"📚 {name or 'file'}\n{size_mb:.1f} MB\n\n"
@@ -1497,10 +1385,17 @@ async def on_forwarded_book(event):
         # precache. They're a list/database for the ABB, not hot public links, so
         # pre-downloading them just burns Telegram bandwidth and evicts real singles.
         # Personal singles (Cerina's own forwards) keep the immediate cache.
+        #
+        # A reused link skips this too: the copy belongs to the link people will
+        # actually open, and pre-caching this second message would put a second
+        # copy of one book on the box under a token nobody has.
         is_group_forward = event.chat_id in NO_PRECACHE_CHATS
-        if not is_group_forward:
+        if not is_group_forward and not reuse:
             asyncio.create_task(precache_in_background(event.chat_id, event.message.id, event.message, cli, account))
-        log.info(f"link issued for {name} ({event.chat_id}/{event.message.id}, account {account}, group={is_group_forward})")
+        log.info(
+            f"link {'reused' if reuse else 'issued'} for {name} "
+            f"({event.chat_id}/{event.message.id}, account {account}, group={is_group_forward})"
+        )
     except Exception as e:
         log.error(f"link handler error: {e}")
         await event.reply(f"couldn't make a link: {e}")
@@ -1526,7 +1421,6 @@ async def on_unlisted_group_media(event):
 
 
 async def on_startup(app):
-    _buzz_load()
     _ultra_load()
     await client.start()
     client.add_event_handler(
@@ -1552,7 +1446,6 @@ async def on_startup(app):
     asyncio.create_task(ultra_save_loop())
     asyncio.create_task(cache_cleanup_loop())
     asyncio.create_task(disk_alert_loop())
-    asyncio.create_task(buzz_reconcile_loop())
     asyncio.create_task(premium_watch_loop())
     await resolve_download_account(initial=True)
     flags = await _premium_flags()
