@@ -28,6 +28,7 @@ from collections import deque
 import hashlib
 import logging
 import shutil
+import sqlite3
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -1156,7 +1157,30 @@ async def handle_robots(request):
 STATUS_USER = os.environ.get("BOOKLINK_STATUS_USER", "")
 STATUS_PASS = os.environ.get("BOOKLINK_STATUS_PASS", "")
 STATUS_KEY = os.environ.get("BOOKLINK_STATUS_KEY", "")
+FILES_DB = os.environ.get("BOOKLINK_FILES_DB", "")
 _disk_cache = (0.0, "")
+
+
+def _catalogue_query(query: str, limit: int = 100) -> list:
+    """Search the recorded link catalogue by filename.
+
+    Runs in an executor: it is an unindexed scan over a few hundred thousand
+    rows, which is fine as a one-off but not something to hold the event loop
+    for.
+    """
+    like = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    con = sqlite3.connect(f"file:{FILES_DB}?mode=ro", uri=True, timeout=5)
+    try:
+        return con.execute(
+            "SELECT filename, size, stored, created_at FROM files "
+            "WHERE filename LIKE ? ESCAPE '\\' ORDER BY created_at DESC LIMIT ?",
+            (like, limit),
+        ).fetchall()
+    except sqlite3.Error as e:
+        log.warning(f"catalogue search failed: {e}")
+        return []
+    finally:
+        con.close()
 
 
 def key_to_token(key: str) -> str:
@@ -1257,6 +1281,12 @@ async def handle_status(request: web.Request):
     else:
         return web.Response(status=404, text="not found")
 
+    query = (request.query.get("q") or "").strip()
+    matches = []
+    if query and FILES_DB and Path(FILES_DB).exists():
+        matches = await asyncio.get_running_loop().run_in_executor(
+            None, _catalogue_query, query)
+
     ready, pending = [], []
     for key, ent in _ultra_map.items():
         (ready if ent.get("url") else pending).append((key, ent))
@@ -1291,6 +1321,40 @@ async def handle_status(request: web.Request):
             "</tr>"
         )
 
+    # Which copies are on the box, to tell a catalogue hit from a live one. Keyed
+    # on the FILENAME, not the link: the same book forwarded to a second chat
+    # mints a second, equally valid token, so a token-keyed lookup reports
+    # perfectly good links as "not copied yet". Tokens are still checked, as a
+    # second chance for a copy whose name was changed on the way in.
+    def _norm(s: str) -> str:
+        return " ".join((s or "").lower().split())
+
+    token_index = {key_to_token(k): (k, e) for k, e in _ultra_map.items() if e.get("url")}
+    name_index = {_norm(e.get("name")): (k, e)
+                  for k, e in _ultra_map.items() if e.get("url") and e.get("name")}
+
+    def match_row(filename, size, stored, created_at):
+        token = (stored or "").rsplit("/", 1)[-1]
+        have = name_index.get(_norm(filename)) or token_index.get(token)
+        link = html.escape(stored or "")
+        name = html.escape(filename or "")
+        if have:
+            _, ent = have
+            state = f'<span class=ok>on the box</span> &middot; {ent.get("hits", 0)} takes'
+        else:
+            state = '<span class=dim>not copied yet</span>'
+        return (
+            f'<tr data-name="{html.escape((filename or "").lower())}" data-size="{size or 0}" '
+            f'data-hits="{have[1].get("hits", 0) if have else -1}" data-added="{created_at or 0}" '
+            f'data-last="{have[1].get("last_hit", 0) if have else 0}">'
+            f'<td class=n>{name}</td><td class=num>{_human(size)}</td>'
+            f'<td class=dim>{state}</td>'
+            f'<td class=dim>{_ago(created_at)}</td>'
+            f'<td class=nowrap><a href="{link}" target=_blank rel=noopener class=lk title="{link}">'
+            f'/b/{html.escape(token)}</a> <a href="#" class=cp data-u="{link}">copy</a></td>'
+            "</tr>"
+        )
+
     disk = await _box_disk()
     body = f"""<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
@@ -1299,6 +1363,7 @@ async def handle_status(request: web.Request):
  :root{{color-scheme:dark}}
  body{{background:#0f1115;color:#dfe3ea;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;padding:28px}}
  h1{{font-size:19px;margin:0 0 4px}}
+ h2{{font-size:15px;margin:26px 0 4px;font-weight:600}} h2.mt{{margin-top:30px}}
  .sub{{color:#8b93a1;font-size:13px;margin-bottom:18px}}
  .cards{{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px}}
  .card{{background:#171a21;border:1px solid #232833;border-radius:9px;padding:11px 15px;min-width:110px}}
@@ -1316,9 +1381,21 @@ async def handle_status(request: web.Request):
  a{{color:#7cc4ff;text-decoration:none;cursor:pointer}} a:hover{{text-decoration:underline}}
  a.dim{{color:#6f7787}} td.nowrap{{white-space:nowrap}}
  a.lk{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}}
+ .ok{{color:#7ee0a4}}
+ form{{display:flex;gap:8px;margin:0 0 20px}}
+ input[type=search]{{flex:1;max-width:520px;background:#171a21;border:1px solid #232833;color:#dfe3ea;
+   border-radius:9px;padding:10px 13px;font:inherit}}
+ input[type=search]:focus{{outline:none;border-color:#3a76aa}}
+ button{{background:#1d2a38;border:1px solid #2c4050;color:#cfe1f3;border-radius:9px;
+   padding:10px 18px;font:inherit;cursor:pointer}}
+ button:hover{{background:#243444}}
 </style></head><body>
 <h1>Public copies</h1>
 <div class=sub>Everything offloaded to the seeding box &mdash; readers are served from here. Click a column to sort: <b>last taken</b> with <b>takes</b> is the pruning view.</div>
+<form method=get action=/status>
+ <input type=search name=q value="{html.escape(query)}" placeholder="Find a book by name &mdash; gives you its link whether it is on the box or not" autocomplete=off>
+ <button type=submit>Find</button>
+</form>
 <div class=cards>
  <div class=card><b>{len(ready)}</b><span>books</span></div>
  <div class=card><b>{_human(total)}</b><span>on the box</span></div>
@@ -1326,7 +1403,21 @@ async def handle_status(request: web.Request):
  <div class=card><b>{never:,}</b><span>never taken</span></div>
  <div class=card><b>{html.escape(disk) if disk else '&mdash;'}</b><span>box quota used</span></div>
 </div>
-<table><thead><tr>
+{"".join(f'''
+<h2>Matches for &ldquo;{html.escape(query)}&rdquo;</h2>
+<div class=sub>{len(matches)} matched, newest first. "not copied yet" still works &mdash;
+it just has no copy on the box, so a reader waits for it to come off Telegram.</div>
+<table id=matches><thead><tr>
+ <th data-k=name>Name</th>
+ <th data-k=size style="text-align:right">Size</th>
+ <th>Copy</th>
+ <th data-k=added>Linked</th>
+ <th>Link</th>
+</tr></thead>
+<tbody>{''.join(match_row(*m) for m in matches) or '<tr><td colspan=5 class=dim>nothing matched</td></tr>'}</tbody></table>
+''') if query else ''}
+<h2 class=mt>Copies on the box</h2>
+<table id=copies><thead><tr>
  <th data-k=name>Name</th>
  <th data-k=size style="text-align:right">Size</th>
  <th data-k=hits style="text-align:right">Takes</th>
@@ -1337,26 +1428,29 @@ async def handle_status(request: web.Request):
 <tbody>{''.join(row(k, e) for k, e in ready)}{''.join(row(k, e) for k, e in pending)}</tbody></table>
 <p class=sub style="margin-top:18px">Books with no row have not been downloaded since the move &mdash; they still work, served from the local cache or Telegram, and get a copy here the next time somebody takes one.</p>
 <script>
-const tb=document.querySelector("tbody"), ths=[...document.querySelectorAll("th[data-k]")];
-let sk="added", sa=false;
-function cmp(k,a,b){{
-  const x=a.dataset[k], y=b.dataset[k];
-  const n=k==="name"?x.localeCompare(y):(parseFloat(x)-parseFloat(y));
-  return sa?n:-n;
+for (const tb of document.querySelectorAll("table[id] tbody")) {{
+  const ths=[...tb.closest("table").querySelectorAll("th[data-k]")];
+  let sk=null, sa=false;
+  const cmp=(k,a,b)=>{{
+    const x=a.dataset[k], y=b.dataset[k];
+    const n=k==="name"?x.localeCompare(y):(parseFloat(x)-parseFloat(y));
+    return sa?n:-n;
+  }};
+  const sort=(k)=>{{
+    if(k===sk) sa=!sa; else {{ sk=k; sa=(k!=="name"); }}
+    [...tb.rows].sort((a,b)=>cmp(sk,a,b)).forEach(r=>tb.appendChild(r));
+    ths.forEach(t=>{{t.classList.toggle("s",t.dataset.k===sk);t.classList.toggle("a",t.dataset.k===sk&&sa);}});
+  }};
+  ths.forEach(t=>t.onclick=()=>sort(t.dataset.k));
+  tb.addEventListener("click",e=>{{
+    const a=e.target.closest("a.cp"); if(!a) return;
+    e.preventDefault();
+    navigator.clipboard.writeText(a.dataset.u);
+    const was=a.textContent; a.textContent="copied";
+    setTimeout(()=>{{a.textContent=was;}},1200);
+  }});
+  sort("added");
 }}
-function sort(k){{
-  if(k===sk) sa=!sa; else {{ sk=k; sa=(k!=="name"); }}
-  [...tb.rows].sort((a,b)=>cmp(sk,a,b)).forEach(r=>tb.appendChild(r));
-  ths.forEach(t=>{{t.classList.toggle("s",t.dataset.k===sk);t.classList.toggle("a",t.dataset.k===sk&&sa);}});
-}}
-ths.forEach(t=>t.onclick=()=>sort(t.dataset.k));
-tb.addEventListener("click",e=>{{
-  const a=e.target.closest("a.cp"); if(!a) return;
-  e.preventDefault();
-  navigator.clipboard.writeText(a.dataset.u);
-  const t=a.textContent; a.textContent="copied"; setTimeout(()=>a.textContent=t,1200);
-}});
-sort("added");
 </script>
 </body></html>"""
     return web.Response(text=body, content_type="text/html")

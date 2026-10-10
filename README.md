@@ -97,6 +97,7 @@ an optimisation, and none of them is required for a link to resolve.
 | `BOOKLINK_ULTRA_MAP` | `/opt/booklink/ultra_map.json` | the URL + hit-count map |
 | `BOOKLINK_STATUS_USER` / `_PASS` | — | login for `/status`; unset means the route 404s |
 | `BOOKLINK_STATUS_KEY` | — | *optional* `?k=` key instead of the login |
+| `BOOKLINK_FILES_DB` | — | the link catalogue, so `/status` can search for any book by name |
 | `BOOKLINK_ALERT_CHAT` | — | where operational alerts are sent |
 | `BOOKLINK_DISK_ALERT_MB` / `_COOLDOWN` | 10 GB / 4h | warn when free space drops below this |
 
@@ -226,6 +227,16 @@ each has been taken, when it was added, and when it was last taken, with every
 column sortable. It answers two different questions — *did the thing I just
 posted actually land?* and *what is worth clearing off the box?* Sorting by
 **last taken** and then **takes** gives the second one directly.
+
+**Search finds a link for any book, not just copied ones.** The dashboard reads
+the link catalogue the bot already records, so typing a title returns the `/b/`
+link whether or not a copy is sitting on the box — which is what makes it usable
+as "where is the link for this" rather than only as a status page. The scan is
+unindexed over a few hundred thousand rows, so it runs off the event loop, and
+each hit is marked with whether a copy exists. That check is keyed on the
+*filename*, not the link: the same book forwarded to a second chat mints a
+second, equally valid token, so a token-keyed lookup calls perfectly good links
+"not copied yet".
 
 It is served by the streamer itself, so there is no second service to run. Two
 details are load-bearing:
