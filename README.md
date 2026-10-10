@@ -27,12 +27,12 @@ Three layers, each doing one job:
 |---|---|
 | **Telegram** | the library. The source of truth. Nothing is ever moved off it. |
 | **Local cache** | a short-lived working copy on disk, so seeks/resumes and repeat hits don't re-hit Telegram. Evicted by age and by total size. |
-| **buzzheavier** *(optional)* | a public copy tier. While a copy is live, `/b/` redirects readers there — which takes the load off Telegram entirely. |
+| **Public copy** *(optional)* | the same book rsynced to a box you already rent. While a copy is there, `/b/` redirects readers to it, taking the load off this server and off Telegram entirely. |
 
-**If any layer fails, the link still works.** A dead or expired buzz copy just
-means the request falls through to the local cache, and a cache miss just means
-we fetch from Telegram again. That's the whole design: each layer is an
-optimisation, and none of them is required for a link to resolve.
+**If any layer fails, the link still works.** A missing or unreachable public
+copy just means the request falls through to the local cache, and a cache miss
+just means we fetch from Telegram again. That's the whole design: each layer is
+an optimisation, and none of them is required for a link to resolve.
 
 ## Setup
 
@@ -90,9 +90,13 @@ optimisation, and none of them is required for a link to resolve.
 | `BOOKLINK_DOWNLOAD_VIA` | `auto` | which account fetches files: `old`, `new`, or `auto` |
 | `BOOKLINK_NO_PRECACHE_CHATS` | — | chats that get a **link only** — no cache, no offload |
 | `BOOKLINK_GROUP_CHATS` | — | groups where posts are treated as first-class sends (see below) |
-| `BOOKLINK_BUZZ_TOKEN` | — | buzzheavier Auth ID; enables the offload tier |
-| `BOOKLINK_BUZZ_DIR` | — | buzz folder id to upload into |
-| `BOOKLINK_BUZZ_MAP` | `/opt/booklink/buzz_map.json` | the id/expiry map |
+| `BOOKLINK_ULTRA_BASE` | — | public URL of the public-copy directory; enables the offload tier |
+| `BOOKLINK_ULTRA_SSH` | — | rsync/ssh target for the copy box, e.g. `user@host` |
+| `BOOKLINK_ULTRA_KEY` | — | private key, readable by the **service user**, not root |
+| `BOOKLINK_ULTRA_DIR` | `www/books` | destination directory, relative to the remote home |
+| `BOOKLINK_ULTRA_MAP` | `/opt/booklink/ultra_map.json` | the URL + hit-count map |
+| `BOOKLINK_STATUS_USER` / `_PASS` | — | login for `/status`; unset means the route 404s |
+| `BOOKLINK_STATUS_KEY` | — | *optional* `?k=` key instead of the login |
 | `BOOKLINK_ALERT_CHAT` | — | where operational alerts are sent |
 | `BOOKLINK_DISK_ALERT_MB` / `_COOLDOWN` | 10 GB / 4h | warn when free space drops below this |
 
@@ -123,8 +127,8 @@ second click waits for the first download rather than racing it.
 ### The link is a pointer, so links survive everything
 
 Because `/b/` re-resolves on every request, the failure modes are all
-degradations rather than breakages. A link whose buzz copy was deleted serves
-from cache; a link whose cache was evicted re-fetches from Telegram. There is no
+degradations rather than breakages. A link whose public copy was cleared off the
+box serves from cache; a link whose cache was evicted re-fetches from Telegram. There is no
 state a link can be in where it stops working while the file still exists on
 Telegram.
 
@@ -180,6 +184,70 @@ lanes:
 
 Without this, a fresh batch of sends can queue behind hours of reader traffic
 and appear to have silently failed.
+
+### Where the public copies live
+
+The tier is deliberately **not** a file-hosting service. The obvious move is to
+upload copies to a PPD host — one that pays uploaders and monetises downloads
+with ads — and that is exactly what was tried first. It ended when a reader
+reported being sent three times to a "install this toolkit" page demanding their
+macOS password: the standard infostealer lure, served selectively by OS and geo
+so that the publisher cannot reproduce it and a clean test on their own machine
+proves nothing. Compromised ad networks are the cost of the model.
+
+So the copies go to a box that is already paid for, over rsync and a dedicated
+key, and the reader's path contains no third party at all. Two consequences:
+
+- **Nothing about `/b/` changes.** A copy is an optimisation, never a
+  dependency: if it is missing or the copy box is down, the same link serves
+  from cache or straight from Telegram.
+- **Two settings on the copy box's web server matter**, and both were wrong at
+  first. The `Content-Disposition` has to be forced, because the redirect target
+  is what the browser acts on — the header set on the `/b/` response is
+  discarded the moment the browser follows the `302`, so an audiobook arrives as
+  `audio/mp4` and opens in the browser's own player instead of saving. And
+  directory listing has to be off: a browsable index of the shelf is both a
+  privacy leak and free crawling. In nginx:
+
+  ```nginx
+  location /books/ {
+      autoindex off;
+      default_type application/octet-stream;
+      add_header Content-Disposition "attachment";
+  }
+  ```
+
+  Range requests still work — nginx handles them, and downloads resume.
+
+### The dashboard
+
+`/status` is a read-only page of the public copies: name, size, how many times
+each has been taken, when it was added, and when it was last taken, with every
+column sortable. It answers two different questions — *did the thing I just
+posted actually land?* and *what is worth clearing off the box?* Sorting by
+**last taken** and then **takes** gives the second one directly.
+
+It is served by the streamer itself, so there is no second service to run. Two
+details are load-bearing:
+
+- **Only `GET` counts as a take.** Players and link-preview bots send `HEAD`,
+  and inflated counts would wreck the one decision the number exists to support.
+  Hit counters are kept in memory and flushed every 30 s, so a burst of readers
+  is not a burst of disk writes.
+- **It is never served without a login**, because it is a complete catalogue of
+  everything on the box. Either a shared basic-auth user for the few people who
+  watch the links land, or `?k=`, or both.
+
+If the dashboard should answer on a hostname the edge only routes `/b/*` for,
+forward it by name at the edge rather than publishing a second URL — guarded on
+the hostname so the forwarded request does not loop:
+
+```js
+if (pathname.startsWith("/status") && url.hostname !== BOOKLINK_HOST) {
+  url.hostname = BOOKLINK_HOST;
+  return fetch(new Request(url, request));
+}
+```
 
 ### A click is not a download
 

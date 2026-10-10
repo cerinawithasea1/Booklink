@@ -1,25 +1,27 @@
-// BookLink edge guard — runs at Cloudflare, in front of the BookLink hosts.
+// BookLink edge guard — runs at Cloudflare, in front of the two BookLink hosts.
 //
-// Why this exists: a single rented server once walked an entire published link
+// Why this exists: one rented server once walked an entire published link
 // catalogue — 989 requests, 81% of a day's traffic — without downloading a
-// single book. The zone-level block that stopped it answers 403, which tells the
-// crawler it was blocked and invites it to come back from a new address. This
-// hands out a plain 404 instead, identical to a dead link, so there is nothing
-// to learn from the response.
+// single book. The zone-level block that stopped it answers 403, which tells
+// the crawler it was blocked and invites it to come
+// back from a new address. This hands out a plain 404 instead, identical to a
+// dead link, so there is nothing to learn from the response.
 //
 // It also caps requests per IP on /b/, which is the part that survives an IP
-// change. A reader clicking books from a forum will never come close to it.
+// change. A reader clicking books from Mobilism will never come close to it.
 //
-// Route it as tightly as the domain allows: a hostname that is entirely
-// BookLink takes <host>/*, a domain that only routes the link path takes
-// <domain>/b/* — leaving the rest of that domain untouched.
+// Attached only to: books.lightweave.uk/* and cerinawithasea.download/b/*
+// plus cerinawithasea.download/status*, which is forwarded to the host below.
 
-// Populated per deployment. Deliberately empty in this repo: naming the
-// addresses you block in public tells the crawler its 404 was a decision
-// rather than a dead link, which is the whole thing the 404 avoids.
 const BLOCKED_IPS = new Set([
   // "203.0.113.10",
 ]);
+
+// The host the BookLink origin answers on. The zone that only routes /b/* has no
+// origin of its own for anything else, so /status is forwarded here by name —
+// otherwise the dashboard would only be reachable on a second, less memorable
+// URL, and the whole point is that the same link can be handed to a few people.
+const BOOKLINK_HOST = "books.lightweave.uk";
 
 // Per-IP ceiling on /b/ within the window. Deliberately generous: the crawler
 // was doing ~80/minute in bursts, a real reader does a handful.
@@ -40,9 +42,17 @@ function notFound() {
 export default {
   async fetch(request) {
     const ip = request.headers.get("CF-Connecting-IP") || "";
-    const { pathname } = new URL(request.url);
+    const url = new URL(request.url);
+    const { pathname } = url;
 
     if (ip && BLOCKED_IPS.has(ip)) return notFound();
+
+    // Guarded on hostname so the forwarded request — which arrives back here on
+    // the BookLink host — falls through to the origin instead of looping.
+    if (pathname.startsWith("/status") && url.hostname !== BOOKLINK_HOST) {
+      url.hostname = BOOKLINK_HOST;
+      return fetch(new Request(url, request));
+    }
 
     if (pathname.startsWith("/b/") && ip) {
       const now = Date.now();

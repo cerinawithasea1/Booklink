@@ -16,11 +16,13 @@ session-scheduler (same account, separate login = fine, like a second device).
 Built by Uncle Fable with Cerina, July 11 2026. See BOOKLINK_PLAN.md.
 """
 import os
+import re
 import time
 import json
 import asyncio
 import base64
 import hmac
+import html
 import itertools
 from collections import deque
 import hashlib
@@ -111,7 +113,7 @@ BUZZ_DIR = os.environ.get("BOOKLINK_BUZZ_DIR", "")  # buzz folder id to upload i
 BUZZ_MAP_PATH = Path(os.environ.get("BOOKLINK_BUZZ_MAP", "/opt/booklink/buzz_map.json"))
 
 
-class BuzzUploadGate:
+class OffloadGate:
     """One upload at a time, with a fast lane for Cerina's own sends.
 
     Uploads stay serial because they share the same pipe as the downloads. But
@@ -151,7 +153,7 @@ class BuzzUploadGate:
         self._busy = False
 
 
-BUZZ_UPLOAD_GATE = BuzzUploadGate()
+OFFLOAD_GATE = OffloadGate()
 _buzz_map = {}  # "chat:msg:account" -> {"id", "expiry", "expiry_epoch", "name"}
 _buzz_lock = asyncio.Lock()
 
@@ -270,12 +272,12 @@ async def buzz_upload(cache_file: Path, name: str, high: bool = True) -> tuple[s
     """PUT the cached file to buzzheavier; returns (file_id, expiry ISO or None).
 
     `high` puts this upload in the fast lane — True for books Cerina just sent,
-    False for reader-click-triggered ones (see BuzzUploadGate)."""
+    False for reader-click-triggered ones (see OffloadGate)."""
     raw_name = name
     name = quote(name)[:500]
     note = base64.b64encode(name.encode()).decode()
     base = f"https://w.buzzheavier.com/{BUZZ_DIR}/{name}" if BUZZ_DIR else f"https://w.buzzheavier.com/{name}"
-    await BUZZ_UPLOAD_GATE.acquire(high)
+    await OFFLOAD_GATE.acquire(high)
     try:
         log.info(f"buzz: uploading {raw_name[:60]} (priority={'send' if high else 'click'})")
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=60)
@@ -318,14 +320,14 @@ async def buzz_upload(cache_file: Path, name: str, high: bool = True) -> tuple[s
             data = body.get("data") or {}
             return data["id"], data.get("expiry")
     finally:
-        BUZZ_UPLOAD_GATE.release()
+        OFFLOAD_GATE.release()
 
 
 _offload_inflight = set()
 
 
 async def buzz_offload_task(key, chat_id, message_id, account, cache_file, name, high=True):
-    """Upload one book to buzz. `high` = Cerina's own send (see BuzzUploadGate).
+    """Upload one book to buzz. `high` = Cerina's own send (see OffloadGate).
 
     One upload per key at a time, tracked per-key rather than under the global
     map lock: that lock used to be held across the whole upload, which queued
@@ -356,6 +358,141 @@ async def buzz_offload_task(key, chat_id, message_id, account, cache_file, name,
         log.info(f"buzz offloaded {key} -> {fid} (expires {expiry})")
     finally:
         _offload_inflight.discard(key)
+
+# ---------------------------------------------------------------------------
+# Public offload tier — the seeding box
+#
+# Replaces buzzheavier, disabled 2026-10-10 after its ad-funded landing page
+# served a reader a macOS infostealer lure. The public copy now goes to Cerina's
+# own seeding box, whose nginx serves static files openly from ~/www/books (the
+# auth there covers only PHP and WebDAV). A book becomes a copy over SSH with a
+# dedicated key, so the reader's path contains no third party and no ads at all.
+#
+# Telegram stays the source of truth exactly as before: if the box is full,
+# unreachable, or the copy is deleted, /b/ simply serves locally again.
+# ---------------------------------------------------------------------------
+ULTRA_BASE = os.environ.get("BOOKLINK_ULTRA_BASE", "").rstrip("/")
+ULTRA_SSH = os.environ.get("BOOKLINK_ULTRA_SSH", "")       # user@host
+ULTRA_KEY = os.environ.get("BOOKLINK_ULTRA_KEY", "")       # private key for that host
+ULTRA_DIR = os.environ.get("BOOKLINK_ULTRA_DIR", "www/books")
+ULTRA_MAP_PATH = Path(os.environ.get("BOOKLINK_ULTRA_MAP", "/opt/booklink/ultra_map.json"))
+ULTRA_ENABLED = bool(ULTRA_BASE and ULTRA_SSH and ULTRA_KEY)
+
+_ultra_map = {}  # "chat:msg:account" -> {"url", "name", "file", "size", "added", "hits"}
+_ultra_lock = asyncio.Lock()
+_ultra_inflight = set()
+_ultra_dirty = False  # hit counters changed since the last flush
+
+
+def _ultra_hit(key: str) -> None:
+    """Record a reader being sent to the public copy. Cheap: memory only.
+
+    Counting here rather than flushing on every click keeps a burst of traffic
+    from turning into a burst of disk writes; ultra_save_loop flushes later.
+    """
+    global _ultra_dirty
+    ent = _ultra_map.get(key)
+    if ent and ent.get("url"):
+        ent["hits"] = ent.get("hits", 0) + 1
+        ent["last_hit"] = time.time()
+        _ultra_dirty = True
+
+
+async def ultra_save_loop():
+    global _ultra_dirty
+    while True:
+        await asyncio.sleep(30)
+        if _ultra_dirty:
+            async with _ultra_lock:
+                try:
+                    _ultra_save()
+                    _ultra_dirty = False
+                except Exception as e:
+                    log.warning(f"ultra map flush failed: {e}")
+
+
+def _ultra_load():
+    global _ultra_map
+    if ULTRA_MAP_PATH.is_file():
+        try:
+            _ultra_map = json.loads(ULTRA_MAP_PATH.read_text())
+            log.info(f"ultra map loaded: {len(_ultra_map)} entries")
+        except Exception as e:
+            log.warning(f"ultra map unreadable, starting empty: {e}")
+
+
+def _ultra_save():
+    tmp = ULTRA_MAP_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(_ultra_map, indent=1))
+    os.replace(tmp, ULTRA_MAP_PATH)
+
+
+def _ultra_live(key: str):
+    """Return the entry if a public copy has been recorded for this book."""
+    ent = _ultra_map.get(key)
+    return ent if ent and ent.get("url") else None
+
+
+def _ultra_filename(key: str, name: str) -> str:
+    """A readable, collision-proof public name: the book's title plus a short hash."""
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        stem, ext = name, "bin"
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", stem).strip("-")[:80] or "book"
+    digest = hashlib.sha1(key.encode()).hexdigest()[:10]
+    return f"{slug}-{digest}.{ext.lower()}"
+
+
+async def ultra_offload_task(key, chat_id, message_id, account, cache_file, name, high=True):
+    """Copy one cached book to the public box and record its URL.
+
+    One copy per key at a time, and serialised against every other copy through
+    the shared gate, because the transfer shares the pipe with the downloads.
+    """
+    if not ULTRA_ENABLED or key in _ultra_inflight or _ultra_live(key):
+        return
+    _ultra_inflight.add(key)
+    try:
+        await OFFLOAD_GATE.acquire(high)
+        try:
+            remote_name = _ultra_filename(key, name)
+            log.info(f"offload: copying {remote_name} ({'send' if high else 'click'})")
+            proc = await asyncio.create_subprocess_exec(
+                "rsync", "--inplace",
+                "-e", f"ssh -i {ULTRA_KEY} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
+                str(cache_file), f"{ULTRA_SSH}:{ULTRA_DIR}/{remote_name}",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, err = await proc.communicate()
+            if proc.returncode != 0:
+                raise RuntimeError((err or b"").decode()[-300:] or f"rsync exit {proc.returncode}")
+        finally:
+            OFFLOAD_GATE.release()
+        url = f"{ULTRA_BASE}/{quote(remote_name)}"
+        try:
+            size = Path(cache_file).stat().st_size
+        except OSError:
+            size = 0
+        async with _ultra_lock:
+            _ultra_map[key] = {
+                "url": url,
+                "name": name,
+                "file": remote_name,
+                "size": size,
+                "added": time.time(),
+                "hits": 0,
+            }
+            _ultra_save()
+        log.info(f"offloaded {key} -> {url}")
+    except Exception as e:
+        log.warning(f"offload failed for {key}: {e}")
+        async with _ultra_lock:
+            _ultra_map[key] = {"retry_after": time.time() + 3600}
+            _ultra_save()
+    finally:
+        _ultra_inflight.discard(key)
+
 
 client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 new_client = None
@@ -712,15 +849,15 @@ async def precache_in_background(chat_id, message_id, msg, cli, account=ACCOUNT_
                     return
                 cli = own
         await download_to_cache(chat_id, message_id, msg, cli, account)
-        # Buzz offload belongs here too: the point of precaching personal sends
-        # is to have copies ready BEFORE anyone clicks, so upload right away
-        # (group chats excluded — they only ever get click-triggered offload).
-        if BUZZ_TOKEN and chat_id not in NO_PRECACHE_CHATS:
+        # The public copy belongs here too: the point of precaching personal sends
+        # is to have copies ready BEFORE anyone clicks, so copy right away
+        # (link-only chats excluded — they only ever get click-triggered offload).
+        if ULTRA_ENABLED and chat_id not in NO_PRECACHE_CHATS:
             key = _buzz_key(chat_id, message_id, account)
-            if not _buzz_live(key) and time.time() >= (_buzz_map.get(key) or {}).get("retry_after", 0):
+            if not _ultra_live(key) and time.time() >= (_ultra_map.get(key) or {}).get("retry_after", 0):
                 name, _, _ = media_info(msg)
                 cache_file = cache_path(chat_id, message_id, account)
-                asyncio.create_task(buzz_offload_task(key, chat_id, message_id, account, cache_file, name))
+                asyncio.create_task(ultra_offload_task(key, chat_id, message_id, account, cache_file, name))
     except Exception as e:
         log.warning(f"background precache failed for {chat_id}/{message_id}: {e}")
 
@@ -789,17 +926,22 @@ async def handle_book(request: web.Request):
     cache_file = cache_path(chat_id, message_id, account)
     meta_file = Path(str(cache_file) + ".meta.json")
 
-    # Buzz BEFORE the local-cache check. The local cache is evicted after 24h
-    # but a buzz copy lives 8 days, so requiring a cached file to reach the
-    # redirect would re-download every book older than a day from Telegram on
-    # every single click. Readers hammering one popular link then keep the
-    # download semaphore full and starve send-time precache, so nothing new
-    # ever reaches buzz. A live buzz copy is a complete answer on its own;
-    # if it's dead or absent we fall through to the cache/Telegram paths.
-    if BUZZ_TOKEN and chat_id not in NO_PRECACHE_CHATS:
-        ent = _buzz_live(_buzz_key(chat_id, message_id, account))
+    # The public copy is checked BEFORE the local-cache check. The cache is
+    # evicted after 24h but the copy persists, so requiring a cached file to
+    # reach the redirect would re-download every book older than a day from
+    # Telegram on every single click — and readers hammering one popular link
+    # then keep the download semaphore full. A copy on the box is a complete
+    # answer on its own; if it's absent we fall through to cache/Telegram.
+    if ULTRA_ENABLED and chat_id not in NO_PRECACHE_CHATS:
+        key = _buzz_key(chat_id, message_id, account)
+        ent = _ultra_live(key)
         if ent:
-            return web.HTTPFound(f"https://buzzheavier.com/{ent['id']}")
+            # Only GETs count as a reader: players and link-preview bots send
+            # HEADs, and inflating the count would break exactly the pruning
+            # decision the number exists to support.
+            if request.method == "GET":
+                _ultra_hit(key)
+            return web.HTTPFound(ent["url"])
 
     # Fast path: fully cached book with known metadata. Served with NO Telegram
     # round-trip, so Telegram throttling/outages can never break posted links.
@@ -811,25 +953,27 @@ async def handle_book(request: web.Request):
             name = None
         if name:
             safe_name = name.replace('"', "'")
-            # buzzheavier offload: while a live copy exists, send readers to it
-            # (their browser passes Cloudflare; the download also feeds buzz's
-            # permanence counter). Never offload group/private ABS material.
+            # While a public copy exists, send readers to it — that keeps the
+            # load off Telegram and off this box entirely. Never offload
+            # link-only chats.
             on_download = None
-            if BUZZ_TOKEN and chat_id not in NO_PRECACHE_CHATS:
+            if ULTRA_ENABLED and chat_id not in NO_PRECACHE_CHATS:
                 key = _buzz_key(chat_id, message_id, account)
-                ent = _buzz_live(key)
+                ent = _ultra_live(key)
                 if ent:
-                    return web.HTTPFound(f"https://buzzheavier.com/{ent['id']}")
-                if time.time() >= (_buzz_map.get(key) or {}).get("retry_after", 0):
-                    # Mint the public copy only once the client has actually
-                    # taken the file, behind Cerina's own sends (high=False).
-                    # A click on its own proves nothing — a crawler can click
-                    # anything, and on 2026-10-07 one did exactly that.
+                    if request.method == "GET":
+                        _ultra_hit(key)
+                    return web.HTTPFound(ent["url"])
+                if time.time() >= (_ultra_map.get(key) or {}).get("retry_after", 0):
+                    # Copy the book only once the client has actually taken the
+                    # file, behind Cerina's own sends (high=False). A click on
+                    # its own proves nothing — a crawler can click anything,
+                    # and on 2026-10-07 one did exactly that.
                     who = real_ip(request)
 
                     def _mint_copy(key=key, who=who):
-                        log.info(f"download completed ({who}) — minting buzz copy for {key}")
-                        return buzz_offload_task(
+                        log.info(f"download completed ({who}) — queuing public copy for {key}")
+                        return ultra_offload_task(
                             key, chat_id, message_id, account, cache_file, name, high=False
                         )
 
@@ -908,20 +1052,22 @@ async def handle_book(request: web.Request):
     except Exception as e:
         log.warning(f"meta write failed for {cache_file.name}: {e}")
 
-    # buzzheavier offload (same as fast path above).
+    # Public offload (same rule as the fast path above).
     on_download = None
-    if BUZZ_TOKEN and chat_id not in NO_PRECACHE_CHATS:
+    if ULTRA_ENABLED and chat_id not in NO_PRECACHE_CHATS:
         key = _buzz_key(chat_id, message_id, account)
-        ent = _buzz_live(key)
+        ent = _ultra_live(key)
         if ent:
-            return web.HTTPFound(f"https://buzzheavier.com/{ent['id']}")
-        if time.time() >= (_buzz_map.get(key) or {}).get("retry_after", 0):
+            if request.method == "GET":
+                _ultra_hit(key)
+            return web.HTTPFound(ent["url"])
+        if time.time() >= (_ultra_map.get(key) or {}).get("retry_after", 0):
             # Same rule as the fast path: only once the file is really taken.
             who = real_ip(request)
 
             def _mint_copy(key=key, who=who):
-                log.info(f"download completed ({who}) — minting buzz copy for {key}")
-                return buzz_offload_task(
+                log.info(f"download completed ({who}) — queuing public copy for {key}")
+                return ultra_offload_task(
                     key, chat_id, message_id, account, cache_file, name, high=False
                 )
 
@@ -999,6 +1145,223 @@ async def handle_robots(request):
     return web.Response(text="User-agent: *\nDisallow: /\n", content_type="text/plain")
 
 
+# ---------------------------------------------------------------------------
+# /status — a glance at the public copies
+#
+# Deliberately shaped like the file list buzzheavier showed: name, size, how
+# many times taken, when it was added, and the link. The point is that deciding
+# what to rotate off the box becomes a look rather than a guess — and that
+# "have the links landed" is answerable at a glance for a recent batch.
+# ---------------------------------------------------------------------------
+STATUS_USER = os.environ.get("BOOKLINK_STATUS_USER", "")
+STATUS_PASS = os.environ.get("BOOKLINK_STATUS_PASS", "")
+STATUS_KEY = os.environ.get("BOOKLINK_STATUS_KEY", "")
+_disk_cache = (0.0, "")
+
+
+def key_to_token(key: str) -> str:
+    """The /b/ token for an offload map key ("chat:msg:account")."""
+    try:
+        chat, msg, account = key.split(":")
+        return encode_ref(int(chat), int(msg), int(account))
+    except Exception:
+        return ""
+
+
+def link_for(key: str) -> str:
+    """Rebuild the permanent /b/ link from an offload map key.
+
+    The link is the thing that gets posted, so the dashboard shows it rather than
+    only the file behind it — checking a link has landed means checking the link.
+    """
+    token = key_to_token(key)
+    return f"{PUBLIC_BASE}/b/{token}" if token else ""
+
+
+def _ago(ts: float) -> str:
+    if not ts:
+        return "—"
+    d = max(0, time.time() - ts)
+    if d < 3600:
+        return f"{int(d // 60)}m ago"
+    if d < 86400:
+        return f"{int(d // 3600)}h ago"
+    return f"{int(d // 86400)}d ago"
+
+
+def _human(n: float) -> str:
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:,.0f} {unit}" if unit == "B" else f"{n:,.1f} {unit}"
+        n /= 1024
+
+
+def _to_gb(tok: str) -> float:
+    """Normalise a `quota -s` figure ("55951M", "1863G", "1.8T") to GB."""
+    mult = {"K": 1 / 1024 / 1024, "M": 1 / 1024, "G": 1, "T": 1024}
+    try:
+        return float(tok[:-1]) * mult.get(tok[-1].upper(), 1)
+    except (ValueError, IndexError):
+        return 0.0
+
+
+async def _box_disk() -> str:
+    """Used-vs-quota on the seeding box, cached 5 min so the page stays snappy.
+
+    `df` on these hosts reports the whole shared volume (26 TB across every
+    customer), which says nothing about how much room *she* has — `quota -s`
+    is her own 2 TB allowance.
+    """
+    global _disk_cache
+    ts, val = _disk_cache
+    if time.time() - ts < 300:
+        return val
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ssh", "-i", ULTRA_KEY,
+            "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+            ULTRA_SSH, "quota -s 2>/dev/null | tail -1 | awk '{print $2\" \"$3}'",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+        used, quota = out.decode().split()[:2]
+        u, q = _to_gb(used), _to_gb(quota)
+        val = f"{_human(u * 1024**3)} / {_human(q * 1024**3)} ({u / q * 100:.0f}% full)" if q else ""
+    except Exception:
+        val = ""
+    _disk_cache = (time.time(), val)
+    return val
+
+
+async def handle_status(request: web.Request):
+    # One shared login for the handful of people who watch the links land. It is
+    # a full catalogue of everything on the box, so it is never served openly.
+    # A `?k=` key is also accepted, for a bookmark or a quick curl.
+    if STATUS_KEY and hmac.compare_digest(request.query.get("k", ""), STATUS_KEY):
+        pass
+    elif STATUS_USER and STATUS_PASS:
+        auth = request.headers.get("Authorization", "")
+        ok = False
+        if auth.startswith("Basic "):
+            try:
+                user, _, pwd = base64.b64decode(auth[6:]).decode().partition(":")
+                ok = (hmac.compare_digest(user, STATUS_USER)
+                      and hmac.compare_digest(pwd, STATUS_PASS))
+            except Exception:
+                ok = False
+        if not ok:
+            return web.Response(
+                status=401, text="login required",
+                headers={"WWW-Authenticate": 'Basic realm="BookLink"'})
+    else:
+        return web.Response(status=404, text="not found")
+
+    ready, pending = [], []
+    for key, ent in _ultra_map.items():
+        (ready if ent.get("url") else pending).append((key, ent))
+    ready.sort(key=lambda kv: kv[1].get("added", 0), reverse=True)
+
+    total = sum(e.get("size", 0) for _, e in ready)
+    hits = sum(e.get("hits", 0) for _, e in ready)
+    never = sum(1 for _, e in ready if not e.get("hits"))
+
+    def row(key, ent):
+        name = html.escape(ent.get("name") or key)
+        if not ent.get("url"):
+            return f'<tr class=p data-added="0"><td class=n>{name}</td><td colspan=5 class=dim>waiting — retrying</td></tr>'
+        url = html.escape(ent["url"])
+        b_link = html.escape(link_for(key))
+        added = ent.get("added") or 0
+        last = ent.get("last_hit") or 0
+        hit = ent.get("hits", 0)
+        return (
+            f'<tr data-name="{html.escape((ent.get("name") or "").lower())}" '
+            f'data-size="{ent.get("size", 0)}" data-hits="{hit}" '
+            f'data-added="{added}" data-last="{last}">'
+            f'<td class=n>{name}</td>'
+            f'<td class=num>{_human(ent["size"]) if ent.get("size") else "—"}</td>'
+            f'<td class="num{"" if hit else " z"}">{hit}</td>'
+            f'<td class=dim>{_ago(added)}</td>'
+            f'<td class=dim>{_ago(last) if last else "never"}</td>'
+            f'<td class=nowrap><a href="{b_link}" target=_blank rel=noopener class=lk'
+            f' title="{b_link}">/b/{html.escape(key_to_token(key))}</a>'
+            f' <a href="#" class=cp data-u="{b_link}">copy</a>'
+            f' <a href="{url}" target=_blank rel=noopener class=dim title="the copy on the box">file</a></td>'
+            "</tr>"
+        )
+
+    disk = await _box_disk()
+    body = f"""<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>BookLink &middot; public copies</title>
+<style>
+ :root{{color-scheme:dark}}
+ body{{background:#0f1115;color:#dfe3ea;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;padding:28px}}
+ h1{{font-size:19px;margin:0 0 4px}}
+ .sub{{color:#8b93a1;font-size:13px;margin-bottom:18px}}
+ .cards{{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px}}
+ .card{{background:#171a21;border:1px solid #232833;border-radius:9px;padding:11px 15px;min-width:110px}}
+ .card b{{display:block;font-size:20px;font-weight:650}}
+ .card span{{color:#8b93a1;font-size:11.5px;text-transform:uppercase;letter-spacing:.5px}}
+ table{{width:100%;border-collapse:collapse}}
+ th{{text-align:left;color:#8b93a1;font-weight:500;font-size:11.5px;text-transform:uppercase;letter-spacing:.5px;padding:8px 10px;border-bottom:1px solid #232833;cursor:pointer;user-select:none;white-space:nowrap}}
+ th:hover{{color:#dfe3ea}} th.s::after{{content:" ↓"}} th.s.a::after{{content:" ↑"}}
+ td{{padding:8px 10px;border-bottom:1px solid #1b1f28}}
+ td.n{{max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+ td.num{{text-align:right;font-variant-numeric:tabular-nums;color:#a8b0be}}
+ td.z{{color:#6f7787}}
+ td.dim{{color:#6f7787}}
+ tr.p td{{color:#6f7787}}
+ a{{color:#7cc4ff;text-decoration:none;cursor:pointer}} a:hover{{text-decoration:underline}}
+ a.dim{{color:#6f7787}} td.nowrap{{white-space:nowrap}}
+ a.lk{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}}
+</style></head><body>
+<h1>Public copies</h1>
+<div class=sub>Everything offloaded to the seeding box &mdash; readers are served from here. Click a column to sort: <b>last taken</b> with <b>takes</b> is the pruning view.</div>
+<div class=cards>
+ <div class=card><b>{len(ready)}</b><span>books</span></div>
+ <div class=card><b>{_human(total)}</b><span>on the box</span></div>
+ <div class=card><b>{hits:,}</b><span>reader clicks</span></div>
+ <div class=card><b>{never:,}</b><span>never taken</span></div>
+ <div class=card><b>{html.escape(disk) if disk else '&mdash;'}</b><span>box quota used</span></div>
+</div>
+<table><thead><tr>
+ <th data-k=name>Name</th>
+ <th data-k=size style="text-align:right">Size</th>
+ <th data-k=hits style="text-align:right">Takes</th>
+ <th data-k=added>Added</th>
+ <th data-k=last>Last taken</th>
+ <th>Link</th>
+</tr></thead>
+<tbody>{''.join(row(k, e) for k, e in ready)}{''.join(row(k, e) for k, e in pending)}</tbody></table>
+<p class=sub style="margin-top:18px">Books with no row have not been downloaded since the move &mdash; they still work, served from the local cache or Telegram, and get a copy here the next time somebody takes one.</p>
+<script>
+const tb=document.querySelector("tbody"), ths=[...document.querySelectorAll("th[data-k]")];
+let sk="added", sa=false;
+function cmp(k,a,b){{
+  const x=a.dataset[k], y=b.dataset[k];
+  const n=k==="name"?x.localeCompare(y):(parseFloat(x)-parseFloat(y));
+  return sa?n:-n;
+}}
+function sort(k){{
+  if(k===sk) sa=!sa; else {{ sk=k; sa=(k!=="name"); }}
+  [...tb.rows].sort((a,b)=>cmp(sk,a,b)).forEach(r=>tb.appendChild(r));
+  ths.forEach(t=>{{t.classList.toggle("s",t.dataset.k===sk);t.classList.toggle("a",t.dataset.k===sk&&sa);}});
+}}
+ths.forEach(t=>t.onclick=()=>sort(t.dataset.k));
+tb.addEventListener("click",e=>{{
+  const a=e.target.closest("a.cp"); if(!a) return;
+  e.preventDefault();
+  navigator.clipboard.writeText(a.dataset.u);
+  const t=a.textContent; a.textContent="copied"; setTimeout(()=>a.textContent=t,1200);
+}});
+sort("added");
+</script>
+</body></html>"""
+    return web.Response(text=body, content_type="text/html")
+
+
 async def on_forwarded_book(event):
     """Forward any book to a librarian account → get its permanent link back.
 
@@ -1062,6 +1425,7 @@ async def on_unlisted_group_media(event):
 
 async def on_startup(app):
     _buzz_load()
+    _ultra_load()
     await client.start()
     client.add_event_handler(
         on_forwarded_book,
@@ -1083,6 +1447,7 @@ async def on_startup(app):
                 func=lambda e: e.media and not e.is_private and e.chat_id not in GROUP_CHATS,
             ),
         )
+    asyncio.create_task(ultra_save_loop())
     asyncio.create_task(cache_cleanup_loop())
     asyncio.create_task(disk_alert_loop())
     asyncio.create_task(buzz_reconcile_loop())
@@ -1111,6 +1476,7 @@ def build_app():
     # Pretty form: /b/<key>/Any Book Name.m4b  — the name is cosmetic, the key does the work
     app.router.add_get("/b/{token}/{name:.*}", handle_book)
     app.router.add_get("/d/{code}", handle_download)
+    app.router.add_get("/status", handle_status)
     app.on_startup.append(on_startup)
     return app
 
