@@ -1158,6 +1158,7 @@ STATUS_USER = os.environ.get("BOOKLINK_STATUS_USER", "")
 STATUS_PASS = os.environ.get("BOOKLINK_STATUS_PASS", "")
 STATUS_KEY = os.environ.get("BOOKLINK_STATUS_KEY", "")
 FILES_DB = os.environ.get("BOOKLINK_FILES_DB", "")
+EDGE_PASS = os.environ.get("BOOKLINK_EDGE_PASS", "")
 _disk_cache = (0.0, "")
 
 
@@ -1453,7 +1454,14 @@ for (const tb of document.querySelectorAll("table[id] tbody")) {{
 }}
 </script>
 </body></html>"""
-    return web.Response(text=body, content_type="text/html")
+    resp = web.Response(text=body, content_type="text/html")
+    if EDGE_PASS:
+        # Tells the edge guard this browser is one of ours. Checking a batch of
+        # links before posting them is indistinguishable from a crawler from the
+        # outside, so people who can log in here are exempt by that fact alone.
+        resp.set_cookie("bl_pass", EDGE_PASS, secure=True, httponly=True,
+                        samesite="Lax", max_age=90 * 86400)
+    return resp
 
 
 async def on_forwarded_book(event):

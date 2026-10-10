@@ -97,6 +97,7 @@ an optimisation, and none of them is required for a link to resolve.
 | `BOOKLINK_ULTRA_MAP` | `/opt/booklink/ultra_map.json` | the URL + hit-count map |
 | `BOOKLINK_STATUS_USER` / `_PASS` | — | login for `/status`; unset means the route 404s |
 | `BOOKLINK_STATUS_KEY` | — | *optional* `?k=` key instead of the login |
+| `BOOKLINK_EDGE_PASS` | — | shared with the edge guard; exempts logged-in dashboard browsers from auto-blocking |
 | `BOOKLINK_FILES_DB` | — | the link catalogue, so `/status` can search for any book by name |
 | `BOOKLINK_ALERT_CHAT` | — | where operational alerts are sent |
 | `BOOKLINK_DISK_ALERT_MB` / `_COOLDOWN` | 10 GB / 4h | warn when free space drops below this |
@@ -315,6 +316,41 @@ Two things that cost an evening to learn:
 - **A redeployed Worker takes ~10 seconds to reach every edge node**, and during
   that window some requests still hit the previous version. Verify a change with
   several spaced requests, or you will conclude a working deploy has failed.
+
+### Blocking crawlers automatically
+
+Links are public by design, so the place to stop a crawler is in front of the
+origin. Two rules, both learned from real traffic:
+
+- **A burst.** 40 link-opens per IP per minute. A reader opens a handful; the
+  crawler that prompted this did ~80/minute.
+- **A slow walk.** 60 *distinct* links per IP per day. This is the important one:
+  the same crawler came back doing ~100 links over 8 hours — one book at a time,
+  never fast enough for any per-minute limit to notice. Someone reading their way
+  through a series stays well under it; someone enumerating a catalogue does not.
+
+The counters live in a **Durable Object**, one instance per IP. That matters: a
+first attempt kept them in module scope and a burst of 42 requests sailed
+straight past a limit of 40, because module scope is one edge machine's view and
+requests arrive at many. A Durable Object is a single object, so its count is
+the real count.
+
+`Range` requests are counted separately, against a much higher ceiling. A player
+seeking through an audiobook issues them constantly — one reader generated 64 in
+the log — so counting them as link-opens would block a listener for listening.
+They are not exempt, though, or the header would be a way to opt out.
+
+Two details that matter operationally: the answer is a plain **404**, identical
+to a dead link, so the crawler learns nothing and gets no reason to return with
+a new address; and the gate **fails open**, because a broken counter must never
+be why a working link stops working. Blocks expire — an hour for a burst, a day
+for a walk — so a false positive costs a day rather than a reader.
+
+**Blocking your own people is the failure mode to design against.** Checking a
+batch of links before posting them looks exactly like a crawl from the outside.
+So logging into the dashboard sets a cookie the guard accepts, and that browser
+is never counted. The cookie is only ever issued by the origin behind the
+dashboard login, and it never travels inside a link.
 
 ## Notes
 
