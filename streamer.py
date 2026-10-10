@@ -100,6 +100,13 @@ GROUP_CHATS = {
     if x.lstrip("-").isdigit()
 }
 
+# Every chat whose media should mint a link: private chats, plus any group listed
+# in either lane. The two lanes mean different things for copies, not for links —
+# a NO_PRECACHE group is a catalogue, and a catalogue still needs its links or
+# there is nothing to put in the tags. Without this, a group added to the
+# link-only lane would mint nothing at all and only ever say "not handled".
+INTAKE_CHATS = GROUP_CHATS | NO_PRECACHE_CHATS
+
 FILEBOX_URL = os.environ.get("BOOKLINK_FILEBOX_URL", "http://127.0.0.1:12345")
 
 
@@ -711,7 +718,8 @@ async def _download_once(cache_file, chat_id, message_id, msg, cli, account):
     return cache_file
 
 
-async def precache_in_background(chat_id, message_id, msg, cli, account=ACCOUNT_OLD):
+async def precache_in_background(chat_id, message_id, msg, cli, account=ACCOUNT_OLD,
+                                 force_copy=False):
     try:
         dcli = pick_cli_for(account, chat_id)
         if dcli is None:
@@ -733,9 +741,14 @@ async def precache_in_background(chat_id, message_id, msg, cli, account=ACCOUNT_
                     return
         await download_to_cache(chat_id, message_id, msg, cli, account)
         # The public copy belongs here too: the point of precaching personal sends
-        # is to have copies ready BEFORE anyone clicks, so copy right away
-        # (link-only chats excluded — they only ever get click-triggered offload).
-        if ULTRA_ENABLED and chat_id not in NO_PRECACHE_CHATS:
+        # is to have copies ready BEFORE anyone clicks, so copy right away.
+        #
+        # Link-only chats are the exception — that lane exists so a catalogue feed
+        # doesn't drag thousands of books through the cache and the box. `force_copy`
+        # is for the one case where that reasoning doesn't hold: a book from a
+        # link-only lane that somebody deliberately pulled out and re-sent, which is
+        # a person asking for a copy rather than a feed producing one.
+        if ULTRA_ENABLED and (force_copy or chat_id not in NO_PRECACHE_CHATS):
             key = _offload_key(chat_id, message_id, account)
             if not _ultra_live(key) and time.time() >= (_ultra_map.get(key) or {}).get("retry_after", 0):
                 name, _, _ = media_info(msg)
@@ -774,7 +787,7 @@ async def warm_reused_link(link: str) -> None:
         log.warning(f"reused link points at {chat_id}/{message_id} but the file is not reachable")
         return
     log.info(f"warming the reused link {chat_id}/{message_id} (account {account})")
-    await precache_in_background(chat_id, message_id, msg, cli, account)
+    await precache_in_background(chat_id, message_id, msg, cli, account, force_copy=True)
 
 
 def real_ip(request: web.Request) -> str:
@@ -847,7 +860,7 @@ async def handle_book(request: web.Request):
     # Telegram on every single click — and readers hammering one popular link
     # then keep the download semaphore full. A copy on the box is a complete
     # answer on its own; if it's absent we fall through to cache/Telegram.
-    if ULTRA_ENABLED and chat_id not in NO_PRECACHE_CHATS:
+    if ULTRA_ENABLED:
         key = _offload_key(chat_id, message_id, account)
         ent = _ultra_live(key)
         if ent:
@@ -869,10 +882,15 @@ async def handle_book(request: web.Request):
         if name:
             safe_name = name.replace('"', "'")
             # While a public copy exists, send readers to it — that keeps the
-            # load off Telegram and off this box entirely. Never offload
-            # link-only chats.
+            # load off Telegram and off this box entirely.
+            #
+            # Link-only chats are included here, and that is the distinction the
+            # lane is really about: a catalogue must not be *pre*-downloaded, but a
+            # book somebody actually opened is a person asking for that one book,
+            # and copying it is what makes their second visit instant. Excluding
+            # them here meant every later click was a cold fetch forever.
             on_download = None
-            if ULTRA_ENABLED and chat_id not in NO_PRECACHE_CHATS:
+            if ULTRA_ENABLED:
                 key = _offload_key(chat_id, message_id, account)
                 ent = _ultra_live(key)
                 if ent:
@@ -969,7 +987,7 @@ async def handle_book(request: web.Request):
 
     # Public offload (same rule as the fast path above).
     on_download = None
-    if ULTRA_ENABLED and chat_id not in NO_PRECACHE_CHATS:
+    if ULTRA_ENABLED:
         key = _offload_key(chat_id, message_id, account)
         ent = _ultra_live(key)
         if ent:
@@ -1469,14 +1487,14 @@ async def on_startup(app):
             on_forwarded_book,
             events.NewMessage(
                 incoming=True,
-                func=lambda e: e.media and (e.is_private or e.chat_id in GROUP_CHATS),
+                func=lambda e: e.media and (e.is_private or e.chat_id in INTAKE_CHATS),
             ),
         )
         new_client.add_event_handler(
             on_unlisted_group_media,
             events.NewMessage(
                 incoming=True,
-                func=lambda e: e.media and not e.is_private and e.chat_id not in GROUP_CHATS,
+                func=lambda e: e.media and not e.is_private and e.chat_id not in INTAKE_CHATS,
             ),
         )
     asyncio.create_task(ultra_save_loop())
