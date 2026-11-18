@@ -29,6 +29,7 @@ import hashlib
 import logging
 import shutil
 import sqlite3
+import subprocess
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -38,7 +39,9 @@ from aiohttp import web
 from aiohttp.web_log import AccessLogger
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.errors.rpcerrorlist import FileReferenceExpiredError
+from telethon.errors.rpcerrorlist import (
+    FileReferenceExpiredError, PeerIdInvalidError, FloodWaitError,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("booklink")
@@ -47,6 +50,7 @@ API_ID = int(os.environ["BOOKLINK_API_ID"])
 API_HASH = os.environ["BOOKLINK_API_HASH"]
 SESSION = os.environ["BOOKLINK_SESSION"]           # StringSession for Cerina2 (librarian)
 SESSION_NEW = os.environ.get("BOOKLINK_SESSION_NEW", "")  # optional: fresh librarian account for new links
+SESSION_THIRD = os.environ.get("BOOKLINK_SESSION_THIRD", "")  # optional: spare account for group intake
 PORT = int(os.environ.get("BOOKLINK_PORT", "8091"))
 HOST = os.environ.get("BOOKLINK_HOST", "127.0.0.1")  # localhost-only until a tunnel fronts it
 PUBLIC_BASE = os.environ.get("BOOKLINK_BASE", f"http://127.0.0.1:{PORT}")
@@ -58,6 +62,8 @@ CACHE_MAX_AGE = int(os.environ.get("BOOKLINK_CACHE_MAX_AGE", str(24 * 3600)))  #
 CACHE_MAX_SIZE = int(os.environ.get("BOOKLINK_CACHE_MAX_SIZE", str(18 * 1024**3)))  # bytes (18GB hard cap)
 DISK_ALERT_CHAT = os.environ.get("BOOKLINK_ALERT_CHAT", "cerinawithasea")
 DISK_ALERT_MB = int(os.environ.get("BOOKLINK_DISK_ALERT_MB", "10240"))  # ping if free drops below this
+BOX_ALERT_GB = int(os.environ.get("BOOKLINK_BOX_ALERT_GB", "20"))       # free space on the cache box
+BOX_QUOTA_ALERT_PCT = float(os.environ.get("BOOKLINK_BOX_QUOTA_ALERT_PCT", "85"))  # public copies
 DISK_ALERT_COOLDOWN = int(os.environ.get("BOOKLINK_DISK_ALERT_COOLDOWN", str(4 * 3600)))  # re-alert at most this often
 MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("BOOKLINK_MAX_DOWNLOADS", "4"))
 # Parachute when Telegram throttles one account's GetFileRequest: set
@@ -68,8 +74,6 @@ DOWNLOAD_VIA = os.environ.get("BOOKLINK_DOWNLOAD_VIA", "").strip().lower()
 # Resolved at startup and re-checked by premium_watch_loop. "old"/"new" pins the
 # choice; "auto"/"" lets us pick an account that actually has Telegram Premium.
 _download_via = DOWNLOAD_VIA
-# Group books alternate between the two librarian accounts (see pick_cli_for).
-_group_rr = itertools.cycle(("new", "old"))
 # How many books each account may fetch at once. The legacy account was run
 # strictly serial for a while because parallel downloads on it stacked flood-waits
 # and kept it pegged — but that was a month when its Premium had lapsed, and the
@@ -101,6 +105,16 @@ NO_PRECACHE_CHATS = {
 # precache + offload); they are NOT on the NO_PRECACHE list.
 GROUP_CHATS = {
     int(x) for x in os.environ.get("BOOKLINK_GROUP_CHATS", "").replace(" ", "").split(",")
+    if x.lstrip("-").isdigit()
+}
+
+# Chats that get a link recorded but never a reply. The Backroom has always had a
+# link for every book in the catalogue — that is its whole purpose, one link to put
+# in each book's tags — but the replies were never wanted there; they are noise in
+# a room people scroll. Silently recorded is the shape, not a separate lane: the
+# link is still minted and filed, only the message back into the room is skipped.
+SILENT_CHATS = {
+    int(x) for x in os.environ.get("BOOKLINK_SILENT_CHATS", "").replace(" ", "").split(",")
     if x.lstrip("-").isdigit()
 }
 
@@ -190,6 +204,15 @@ ULTRA_KEY = os.environ.get("BOOKLINK_ULTRA_KEY", "")       # private key for tha
 ULTRA_DIR = os.environ.get("BOOKLINK_ULTRA_DIR", "www/books")
 ULTRA_MAP_PATH = Path(os.environ.get("BOOKLINK_ULTRA_MAP", "/opt/booklink/ultra_map.json"))
 ULTRA_ENABLED = bool(ULTRA_BASE and ULTRA_SSH and ULTRA_KEY)
+
+# The public box may sit behind its provider's own HTTP auth, which cannot be
+# changed from the account. Rather than hand readers a password, serve the copies
+# through here: this service holds the credentials and streams the file, so the
+# URL a reader sees is ours and the password never appears in a link.
+BOX_PROXY_BASE = os.environ.get("BOOKLINK_BOX_PROXY_BASE", "").rstrip("/")
+BOX_PROXY_USER = os.environ.get("BOOKLINK_BOX_PROXY_USER", "")
+BOX_PROXY_PASS = os.environ.get("BOOKLINK_BOX_PROXY_PASS", "")
+_box_session = None
 
 _ultra_map = {}  # "chat:msg:account" -> {"url", "name", "file", "size", "added", "hits"}
 _ultra_lock = asyncio.Lock()
@@ -284,7 +307,7 @@ async def ultra_offload_task(key, chat_id, message_id, account, cache_file, name
             OFFLOAD_GATE.release()
         url = f"{ULTRA_BASE}/{quote(remote_name)}"
         try:
-            size = Path(cache_file).stat().st_size
+            size = (await _aio(Path(cache_file).stat)).st_size
         except OSError:
             size = 0
         async with _ultra_lock:
@@ -298,6 +321,13 @@ async def ultra_offload_task(key, chat_id, message_id, account, cache_file, name
             }
             _ultra_save()
         log.info(f"offloaded {key} -> {url}")
+        # The copy on the box is what readers are redirected to, so the local
+        # file has done its job and the disk is small. Drop it — but only after
+        # a copy exists, never before.
+        try:
+            await _aio(Path(cache_file).unlink)
+        except OSError as e:
+            log.warning(f"could not drop local cache for {key}: {e}")
     except Exception as e:
         log.warning(f"offload failed for {key}: {e}")
         async with _ultra_lock:
@@ -311,6 +341,19 @@ client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 new_client = None
 if SESSION_NEW:
     new_client = TelegramClient(StringSession(SESSION_NEW), API_ID, API_HASH)
+# An optional third librarian. It exists so group intake can move to a healthy
+# account without disturbing the first two: a link minted by an account can only
+# be fetched by that account when it points at a private chat, so the sessions
+# that own old DM links must stay loaded even if those accounts are restricted.
+third_client = None
+if SESSION_THIRD:
+    third_client = TelegramClient(StringSession(SESSION_THIRD), API_ID, API_HASH)
+
+# Group downloads rotate across the librarians that can still work. When a spare
+# account is present it replaces the new one in the rotation: a frozen account
+# can read — which is what keeps the links it minted serving — but it should not
+# be a workhorse while Telegram is restricting it.
+_group_rr = itertools.cycle(("third", "old") if third_client is not None else ("new", "old"))
 
 CHUNK = 512 * 1024  # 512KB stream chunks
 
@@ -447,16 +490,28 @@ def pick_cli_for(account, chat_id):
     posted to the group gets worked by TWO pipes instead of one. Personal (private)
     books are untouched: only the account that received them can fetch those.
     """
-    if (
-        chat_id in GROUP_CHATS
-        and DOWNLOAD_VIA not in ("old", "new")  # honour an explicit pin
-        and client is not None
-        and new_client is not None
-    ):
+    if chat_id > 0:
+        # A private chat belongs to exactly one account — its message ids are
+        # not shared with anybody — so the download parachute must not redirect
+        # it. Asking the other account for a peer it has never seen raises
+        # "could not find the input entity" and used to surface as a 500.
+        return own_cli(account) or client or new_client
+    if chat_id in GROUP_CHATS and DOWNLOAD_VIA not in ("old", "new"):  # honour a pin
         choice = next(_group_rr)
-        log.info(f"group book {chat_id}: fetching via the {choice} account")
-        return new_client if choice == "new" else client
-    return pick_cli(account)
+        chosen = {"third": third_client, "new": new_client, "old": client}.get(choice)
+        if chosen is not None:
+            log.info(f"group book {chat_id}: fetching via the {choice} account")
+            return chosen
+    cli = pick_cli(account)
+    if cli is None and chat_id < 0:
+        # The token names an account that no longer exists. In a group any
+        # librarian can read the message, so serve it from one that still can
+        # rather than refusing a link that is still perfectly good.
+        for candidate in (third_client, client, new_client):
+            if candidate is not None:
+                log.info(f"group book {chat_id}: token account is gone, using another librarian")
+                return candidate
+    return cli
 
 
 async def _alert(text):
@@ -469,9 +524,9 @@ async def _alert(text):
 
 
 async def _premium_flags():
-    """{'old': bool, 'new': bool} — Telegram Premium on each librarian account."""
+    """Telegram Premium on each librarian account, by label."""
     flags = {}
-    for label, cli in (("old", client), ("new", new_client)):
+    for label, cli in (("old", client), ("new", new_client), ("third", third_client)):
         if cli is None:
             continue
         try:
@@ -605,24 +660,69 @@ def media_info(msg):
     return name, size, mime
 
 
+def _cache_cleanup_once() -> list:
+    """One synchronous sweep of CACHE_DIR, for `cache_cleanup_loop` to run in a thread.
+
+    Touches each directory entry once. The old version walked the directory
+    twice with an `is_file()` and one or two `stat()` calls per file — roughly
+    five round trips each, several hundred entries — on the event loop. Against
+    the sshfs mount that froze the entire service for minutes, which is what
+    took the dashboard down.
+    """
+    now = time.time()
+    removed, kept = [], []
+    with os.scandir(CACHE_DIR) as entries:
+        for entry in entries:
+            try:
+                if not entry.is_file():
+                    continue
+                st = entry.stat()
+            except OSError:
+                continue
+            name = entry.name
+            if ".tmp." in name:
+                # In-flight downloads keep their writer's pid. A temp file whose
+                # process is gone is a leftover from a restart, and it is not
+                # small: 16 of them were holding 4.9 GB.
+                try:
+                    pid = int(name.split(".tmp.", 1)[1].split(".")[0])
+                except (ValueError, IndexError):
+                    pid = None
+                if pid is not None and not _pid_alive(pid):
+                    removed.append(name)
+                continue
+            # A file written minutes ago may still be being copied to the public
+            # box, and evicting it mid-rsync is how a copy fails with "file has
+            # vanished" and lands in the retry queue. Give fresh files room.
+            if now - st.st_mtime < 1800:
+                kept.append((st.st_mtime, st.st_size, name))
+                continue
+            if now - st.st_mtime > CACHE_MAX_AGE:
+                removed.append(name)
+                continue
+            kept.append((st.st_mtime, st.st_size, name))
+    kept.sort()
+    total = sum(size for _, size, _ in kept)
+    while total > CACHE_MAX_SIZE and kept:
+        _, size, name = kept.pop(0)
+        total -= size
+        removed.append(name)
+    gone = []
+    for name in removed:
+        try:
+            os.unlink(os.path.join(CACHE_DIR, name))
+            gone.append(name)
+        except OSError as e:
+            log.warning(f"cache cleanup: could not remove {name}: {e}")
+    return gone
+
+
 async def cache_cleanup_loop():
     while True:
         try:
-            now = time.time()
-            # 1) age-based: drop anything (finished or orphaned) older than the window
-            for f in CACHE_DIR.iterdir():
-                if f.is_file() and now - f.stat().st_mtime > CACHE_MAX_AGE:
-                    f.unlink()
-                    log.info(f"cache cleanup (age): removed {f.name}")
-            # 2) size-based: oldest finished files first, until under the cap
-            finished = [f for f in CACHE_DIR.iterdir() if f.is_file() and f.suffix != ".tmp"]
-            finished.sort(key=lambda f: f.stat().st_mtime)
-            total = sum(f.stat().st_size for f in finished)
-            while total > CACHE_MAX_SIZE and finished:
-                f = finished.pop(0)
-                total -= f.stat().st_size
-                f.unlink()
-                log.info(f"cache cleanup (size): removed {f.name}")
+            removed = await _aio(_cache_cleanup_once)
+            if removed:
+                log.info(f"cache cleanup: removed {len(removed)} files")
         except Exception as e:
             log.error(f"cache cleanup error: {e}")
         await asyncio.sleep(3600)
@@ -640,18 +740,54 @@ async def disk_alert_loop():
     sender = new_client or client
     while True:
         try:
-            free_mb = shutil.disk_usage("/").free // (1024 * 1024)
             now = time.time()
-            if free_mb < DISK_ALERT_MB and now - _last_disk_alert > DISK_ALERT_COOLDOWN:
-                await sender.send_message(
-                    DISK_ALERT_CHAT,
-                    f"⚠️ Low disk on ready-1986: {free_mb} MB free on /",
-                )
-                _last_disk_alert = now
-                log.info(f"disk alert sent to {DISK_ALERT_CHAT} ({free_mb} MB free)")
+            if now - _last_disk_alert > DISK_ALERT_COOLDOWN:
+                warnings = []
+                free_mb = shutil.disk_usage("/").free // (1024 * 1024)
+                if free_mb < DISK_ALERT_MB:
+                    warnings.append(f"{free_mb} MB free on /")
+                # The cache box is a different machine, so its disk filling up
+                # never showed on the local check — which is exactly the one
+                # nobody looks at until downloads start failing.
+                box_free = await _aio(lambda: shutil.disk_usage(CACHE_DIR).free // (1024 ** 3))
+                if box_free < BOX_ALERT_GB:
+                    warnings.append(f"{box_free} GB free on the cache box")
+                # Public copies have no size cap, so this is the one that can
+                # genuinely run out; the quota readout is already cached.
+                pct = _box_disk_pct()
+                if pct >= BOX_QUOTA_ALERT_PCT:
+                    warnings.append(f"public copies at {pct:.0f}% of quota")
+                if warnings:
+                    await sender.send_message(
+                        DISK_ALERT_CHAT, "⚠️ BookLink: " + "; ".join(warnings)
+                    )
+                    _last_disk_alert = now
+                    log.info(f"disk alert sent to {DISK_ALERT_CHAT}: {'; '.join(warnings)}")
         except Exception as e:
             log.error(f"disk alert error: {e}")
         await asyncio.sleep(600)
+
+
+async def _aio(fn, *args):
+    """Run one blocking filesystem call off the event loop.
+
+    Everything under CACHE_DIR lives on the sshfs mount to ultra, so a plain
+    stat or unlink is a network round trip — measured at ~1.9s when the box is
+    busy. Blocking on one does not slow a single request, it stops the loop that
+    serves every /b/ click and the dashboard.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: fn(*args))
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _rm(path):
@@ -666,7 +802,7 @@ async def download_to_cache(chat_id, message_id, msg, cli, account=ACCOUNT_OLD):
     Used by both the background pre-fetch and the on-demand serve path, so a file
     is always served from a complete on-disk copy (never streamed live)."""
     cache_file = cache_path(chat_id, message_id, account)
-    if cache_file.is_file():
+    if await _aio(cache_file.is_file):
         return cache_file
 
     # Single-flight per file: repeated clicks / retries on one uncached link must
@@ -692,15 +828,30 @@ def _inflight_done(cache_file, task):
         task.exception()  # mark retrieved; awaiters still get the raise
 
 
+async def _download_media_to(cli, media, path):
+    """Stream a Telegram file into `path` without blocking the event loop.
+
+    The cache is the sshfs mount to ultra, so every write is a network round
+    trip. Writing them inline stalled the loop for seconds at a time and took
+    the dashboard down with it. The buffer is the chunk size, so one chunk is
+    one round trip rather than the sixty-four an 8 KB default buffer would make.
+    """
+    loop = asyncio.get_running_loop()
+    fh = await loop.run_in_executor(None, lambda: open(path, "wb", buffering=CHUNK))
+    try:
+        async for chunk in cli.iter_download(media, chunk_size=CHUNK):
+            await loop.run_in_executor(None, fh.write, chunk)
+    finally:
+        await loop.run_in_executor(None, fh.close)
+
+
 async def _download_once(cache_file, chat_id, message_id, msg, cli, account):
     tmp = cache_file.with_suffix(f".tmp.{os.getpid()}.{time.time_ns()}")
     sem = DOWNLOAD_SEM_NEW if cli is new_client else DOWNLOAD_SEM_OLD
     async with sem:
         media = msg.media
         try:
-            with open(tmp, "wb") as fh:
-                async for chunk in cli.iter_download(media, chunk_size=CHUNK):
-                    fh.write(chunk)
+            await _download_media_to(cli, media, tmp)
         except FileReferenceExpiredError:
             # refresh the file reference once and retry. Under the parachute the
             # download client may not see this peer (private-chat IDs differ per
@@ -713,9 +864,7 @@ async def _download_once(cache_file, chat_id, message_id, msg, cli, account):
             if fresh and fresh.media:
                 media = fresh.media
                 try:
-                    with open(tmp, "wb") as fh:
-                        async for chunk in cli.iter_download(media, chunk_size=CHUNK):
-                            fh.write(chunk)
+                    await _download_media_to(cli, media, tmp)
                 except Exception:
                     _rm(tmp)
                     raise
@@ -725,8 +874,12 @@ async def _download_once(cache_file, chat_id, message_id, msg, cli, account):
         except Exception:
             _rm(tmp)
             raise
-        os.replace(tmp, cache_file)
-        log.info(f"cached {cache_file.name} ({cache_file.stat().st_size} bytes)")
+        await _aio(os.replace, tmp, cache_file)
+        try:
+            size = (await _aio(cache_file.stat)).st_size
+        except OSError:
+            size = 0
+        log.info(f"cached {cache_file.name} ({size} bytes)")
     return cache_file
 
 
@@ -830,6 +983,45 @@ async def warm_reused_link(link: str) -> None:
     await precache_in_background(chat_id, message_id, msg, cli, account, force_copy=True)
 
 
+def trusted_request(request: web.Request) -> bool:
+    """True when the request carries the dashboard's cookie.
+
+    That cookie is only ever issued by the origin behind the dashboard login, so
+    its presence means a person we know opened the link — which is the same thing
+    a completed transfer was standing in for, without making them wait for the
+    whole book to arrive first.
+    """
+    if not EDGE_PASS:
+        return False
+    return f"bl_pass={EDGE_PASS}" in (request.headers.get("Cookie") or "")
+
+
+async def copy_when_downloaded(dl_task, key, chat_id, message_id, account, name):
+    """Copy a book to the box when it lands on disk, for a reader we know.
+
+    The completed-transfer rule exists so a crawler poking links cannot make us do
+    work. But it also means a big book never copies at all: the server has to pull
+    the whole thing from Telegram before it can send a single byte, and the
+    reader's browser gives up long before that, so the transfer never finishes and
+    the copy never fires. Cancelling the spinning tab was doing exactly this —
+    cached, never copied, every time.
+
+    So for a request carrying the dashboard cookie the signal is the download
+    landing instead. A crawler never has that cookie, so the protection is intact.
+    """
+    if not ULTRA_ENABLED or key in _ultra_inflight or _ultra_live(key):
+        return
+    try:
+        await asyncio.shield(dl_task)
+    except Exception:
+        return
+    path = cache_path(chat_id, message_id, account)
+    if not await _aio(path.is_file):
+        return
+    log.info(f"downloaded for a known reader — queuing public copy for {key}")
+    await ultra_offload_task(key, chat_id, message_id, account, path, name)
+
+
 def real_ip(request: web.Request) -> str:
     """The actual visitor address.
 
@@ -891,6 +1083,16 @@ async def handle_book(request: web.Request):
     except Exception:
         return web.Response(status=400, text="bad link")
 
+    # A repointed link keeps its published URL and serves from a copy that is
+    # still there. Done before the cache lookup so the file is cached and
+    # offloaded under the location it actually came from.
+    target = _repoints.get(token)
+    if target:
+        try:
+            chat_id, message_id, account = decode_ref(target)
+        except Exception:
+            log.warning(f"repoint for {token} is malformed, ignoring it")
+
     cache_file = cache_path(chat_id, message_id, account)
     meta_file = Path(str(cache_file) + ".meta.json")
 
@@ -913,9 +1115,9 @@ async def handle_book(request: web.Request):
 
     # Fast path: fully cached book with known metadata. Served with NO Telegram
     # round-trip, so Telegram throttling/outages can never break posted links.
-    if cache_file.is_file() and meta_file.is_file():
+    if await _aio(lambda: cache_file.is_file() and meta_file.is_file()):
         try:
-            meta = json.loads(meta_file.read_text())
+            meta = json.loads(await _aio(meta_file.read_text))
             name, mime = meta["name"], meta.get("mime", "application/octet-stream")
         except Exception:
             name = None
@@ -966,7 +1168,13 @@ async def handle_book(request: web.Request):
     if cli is None:
         return web.Response(status=503, text="new librarian account not configured yet")
 
-    msg, cli = await get_media_message(chat_id, message_id, cli)
+    try:
+        msg, cli = await get_media_message(chat_id, message_id, cli)
+    except ValueError as e:
+        # An account that has never seen the peer cannot resolve it. That is a
+        # dead end for this link, not a server fault: say "not found", not 500.
+        log.warning(f"link {token}: {e}")
+        return web.Response(status=404, text="file not found (moved or deleted in Telegram)")
     if msg is None and own_cli(account) is not cli:
         # The parachute client can't see this peer: private-chat message IDs
         # differ per account. Fetch with the token account and borrow its
@@ -974,14 +1182,19 @@ async def handle_book(request: web.Request):
         # location); if that download fails we fall back to the token account.
         own = own_cli(account)
         if own is not None:
-            msg, cli = await get_media_message(chat_id, message_id, own)
+            try:
+                msg, cli = await get_media_message(chat_id, message_id, own)
+            except ValueError as e:
+                log.warning(f"link {token}: {e}")
+                msg = None
     if msg is None:
         return web.Response(status=404, text="file not found (moved or deleted in Telegram)")
 
     name, size, mime = media_info(msg)
     safe_name = name.replace('"', "'")
 
-    if not cache_file.is_file():
+    dl_task = None
+    if not await _aio(cache_file.is_file):
         # Run the download as its own task and shield it: when the reader's
         # browser gives up (timeout), the handler is cancelled but the download
         # keeps going, so the next click finds (or waits on) a real cache file.
@@ -1024,6 +1237,13 @@ async def handle_book(request: web.Request):
         meta_file.write_text(json.dumps({"name": name, "mime": mime}))
     except Exception as e:
         log.warning(f"meta write failed for {cache_file.name}: {e}")
+
+    # A known reader shouldn't have to sit through the first fetch to earn a copy.
+    # The transfer completing is the wrong signal for them — see copy_when_downloaded.
+    if dl_task is not None and trusted_request(request):
+        asyncio.create_task(copy_when_downloaded(
+            dl_task, _offload_key(chat_id, message_id, account),
+            chat_id, message_id, account, name))
 
     # Public offload (same rule as the fast path above).
     on_download = None
@@ -1130,8 +1350,71 @@ STATUS_USER = os.environ.get("BOOKLINK_STATUS_USER", "")
 STATUS_PASS = os.environ.get("BOOKLINK_STATUS_PASS", "")
 STATUS_KEY = os.environ.get("BOOKLINK_STATUS_KEY", "")
 FILES_DB = os.environ.get("BOOKLINK_FILES_DB", "")
+DEAD_LINKS_FILE = Path(os.environ.get("BOOKLINK_DEAD_LINKS", "/opt/booklink/dead_links.json"))
+REPOINT_FILE = Path(os.environ.get("BOOKLINK_REPOINTS", "/opt/booklink/repoints.json"))
 EDGE_PASS = os.environ.get("BOOKLINK_EDGE_PASS", "")
 _disk_cache = (0.0, "")
+
+# Links whose Telegram message is gone. Kept beside the service rather than in
+# files.db: the bridge owns that database, and a search that quietly hides a
+# handful of rows needs no write access to somebody else's table.
+_dead_links: set = set()
+
+# Old token -> new token. A published link must never change, but what it points
+# at can: when a book's original message is gone or is owned by an account that
+# is about to be, the same /b/ URL serves the copy that is still readable.
+_repoints: dict = {}
+
+
+def _load_repoints():
+    global _repoints
+    try:
+        if REPOINT_FILE.is_file():
+            _repoints = json.loads(REPOINT_FILE.read_text())
+    except Exception as e:
+        log.warning(f"repoint map unreadable, ignoring it: {e}")
+        _repoints = {}
+    if _repoints:
+        log.info(f"{len(_repoints)} links repointed to a surviving copy")
+
+
+def _save_repoints():
+    tmp = Path(str(REPOINT_FILE) + ".tmp")
+    tmp.write_text(json.dumps(_repoints, indent=0, sort_keys=True))
+    tmp.replace(REPOINT_FILE)
+
+
+def _load_dead_links():
+    global _dead_links
+    try:
+        if DEAD_LINKS_FILE.is_file():
+            _dead_links = set(json.loads(DEAD_LINKS_FILE.read_text()))
+    except Exception as e:
+        log.warning(f"dead-link list unreadable, ignoring it: {e}")
+        _dead_links = set()
+    if _dead_links:
+        log.info(f"{len(_dead_links)} catalogue links are known dead and hidden from search")
+
+
+def _save_dead_links():
+    tmp = Path(str(DEAD_LINKS_FILE) + ".tmp")
+    tmp.write_text(json.dumps(sorted(_dead_links)))
+    tmp.replace(DEAD_LINKS_FILE)
+
+
+def _recent_filed(limit: int = 120) -> list:
+    """The newest rows in the catalogue, copied or not."""
+    con = sqlite3.connect(f"file:{FILES_DB}?mode=ro", uri=True, timeout=5)
+    try:
+        return con.execute(
+            "SELECT filename, size, stored, created_at FROM files "
+            "WHERE stored IS NOT NULL ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+    except sqlite3.Error as e:
+        log.warning(f"recent-filed query failed: {e}")
+        return []
+    finally:
+        con.close()
 
 
 def _catalogue_query(query: str, limit: int = 100) -> list:
@@ -1144,11 +1427,16 @@ def _catalogue_query(query: str, limit: int = 100) -> list:
     like = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
     con = sqlite3.connect(f"file:{FILES_DB}?mode=ro", uri=True, timeout=5)
     try:
-        return con.execute(
+        rows = con.execute(
             "SELECT filename, size, stored, created_at FROM files "
             "WHERE filename LIKE ? ESCAPE '\\' ORDER BY created_at DESC LIMIT ?",
-            (like, limit),
+            (like, limit * 4 if _dead_links else limit),
         ).fetchall()
+        # A row whose message is gone is not an answer — it is a 404 the reader
+        # only discovers after clicking. Hide it and let a live sibling show.
+        if _dead_links:
+            rows = [r for r in rows if r[2] not in _dead_links][:limit]
+        return rows
     except sqlite3.Error as e:
         log.warning(f"catalogue search failed: {e}")
         return []
@@ -1203,32 +1491,732 @@ def _to_gb(tok: str) -> float:
         return 0.0
 
 
-async def _box_disk() -> str:
-    """Used-vs-quota on the seeding box, cached 5 min so the page stays snappy.
+def _read_box_disk() -> str:
+    """Used-vs-quota on the seeding box. Blocking — only ever called from a thread.
 
     `df` on these hosts reports the whole shared volume (26 TB across every
     customer), which says nothing about how much room *she* has — `quota -s`
     is her own 2 TB allowance.
     """
-    global _disk_cache
-    ts, val = _disk_cache
-    if time.time() - ts < 300:
-        return val
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "ssh", "-i", ULTRA_KEY,
-            "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
-            ULTRA_SSH, "quota -s 2>/dev/null | tail -1 | awk '{print $2\" \"$3}'",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-        )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
-        used, quota = out.decode().split()[:2]
+        out = subprocess.run(
+            ["ssh", "-i", ULTRA_KEY,
+             "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+             "-o", "StrictHostKeyChecking=accept-new",
+             ULTRA_SSH, "quota -s 2>/dev/null | tail -1 | awk '{print $2\" \"$3}'"],
+            capture_output=True, timeout=20,
+        ).stdout.decode()
+        used, quota = out.split()[:2]
         u, q = _to_gb(used), _to_gb(quota)
-        val = f"{_human(u * 1024**3)} / {_human(q * 1024**3)} ({u / q * 100:.0f}% full)" if q else ""
+        return f"{_human(u * 1024**3)} / {_human(q * 1024**3)} ({u / q * 100:.0f}% full)" if q else ""
     except Exception:
-        val = ""
-    _disk_cache = (time.time(), val)
-    return val
+        return ""
+
+
+def _box_disk() -> str:
+    """The quota readout, always from cache.
+
+    That ssh lands on the offload box while it is being written to and has taken
+    the better part of a minute under load. It is one number on the dashboard,
+    so the page renders from cache and the refresh happens behind it.
+    """
+    return _disk_cache[1]
+
+
+def _box_disk_pct() -> float:
+    """Percent of the public-copy quota in use, from the cached readout."""
+    m = re.search(r"\(([0-9.]+)% full\)", _box_disk() or "")
+    return float(m.group(1)) if m else 0.0
+
+
+# --- intake watchdog --------------------------------------------------------
+# A stopped pipeline looks like silence: no links, no errors, nothing in the
+# room. This notices that nothing has been filed for a while and says so, so a
+# dead intake is a ping rather than an empty dashboard discovered hours later.
+WATCHDOG_HOURS = float(os.environ.get("BOOKLINK_WATCHDOG_HOURS", "6"))
+WATCHDOG_COOLDOWN = 12 * 3600
+_last_mint = 0.0
+_watchdog_alerted = 0.0
+
+
+def note_mint():
+    global _last_mint
+    _last_mint = time.time()
+
+
+def _last_mint_from_catalogue() -> float:
+    """The newest row in the catalogue, so a restart doesn't look like silence."""
+    if not (FILES_DB and Path(FILES_DB).is_file()):
+        return 0.0
+    try:
+        con = sqlite3.connect(f"file:{FILES_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            row = con.execute("SELECT MAX(created_at) FROM files").fetchone()
+        finally:
+            con.close()
+        return float(row[0] or 0)
+    except Exception:
+        return 0.0
+
+
+async def intake_watchdog_loop():
+    global _last_mint, _watchdog_alerted
+    await asyncio.sleep(60)
+    _last_mint = (await _aio(_last_mint_from_catalogue)) or time.time()
+    while True:
+        try:
+            idle = time.time() - _last_mint
+            if (idle > WATCHDOG_HOURS * 3600
+                    and time.time() - _watchdog_alerted > WATCHDOG_COOLDOWN):
+                await _alert(
+                    f"BookLink: nothing filed for {idle / 3600:.0f} hours. "
+                    f"Existing links still serve — it's new posts that have stopped."
+                )
+                _watchdog_alerted = time.time()
+                log.warning(f"intake watchdog: no book filed for {idle / 3600:.1f} hours")
+        except Exception as e:
+            log.warning(f"intake watchdog failed: {e}")
+        await asyncio.sleep(900)
+
+
+async def box_disk_loop():
+    global _disk_cache
+    while True:
+        try:
+            val = await _aio(_read_box_disk)
+            _disk_cache = (time.time(), val)
+        except Exception as e:
+            log.warning(f"box disk read failed: {e}")
+        await asyncio.sleep(300)
+
+
+async def handle_backfill(request: web.Request):
+    """One-off repair: mint and file links for books posted while nothing could act.
+
+    Walks a chat's history between two unix timestamps and reports every media
+    message to the catalogue. It deliberately does NOT reply in the room — a
+    backfill is repair, not conversation — and the bridge ignores books it
+    already has, so running it twice is harmless.
+
+    Behind the dashboard login: it mints permanent links, which is the same power
+    as posting to the room.
+    """
+    if STATUS_KEY and hmac.compare_digest(request.query.get("k", ""), STATUS_KEY):
+        pass
+    elif STATUS_USER and STATUS_PASS:
+        auth = request.headers.get("Authorization", "")
+        ok = False
+        if auth.startswith("Basic "):
+            try:
+                user, _, pwd = base64.b64decode(auth[6:]).decode().partition(":")
+                ok = (hmac.compare_digest(user, STATUS_USER)
+                      and hmac.compare_digest(pwd, STATUS_PASS))
+            except Exception:
+                ok = False
+        if not ok:
+            return web.Response(status=401, text="login required",
+                                headers={"WWW-Authenticate": 'Basic realm="BookLink"'})
+    else:
+        return web.Response(status=404, text="not found")
+
+    try:
+        chat_id = int(request.query["chat"])
+        since = float(request.query["since"])
+        until = float(request.query.get("until", time.time()))
+    except (KeyError, ValueError):
+        return web.json_response(
+            {"error": "chat, since and until (unix seconds) are required"}, status=400)
+
+    cli = third_client or new_client or client
+    filed = skipped = 0
+    async for msg in cli.iter_messages(
+            chat_id, offset_date=datetime.fromtimestamp(until), limit=None):
+        if msg.date.timestamp() < since:
+            break
+        doc = getattr(getattr(msg, "media", None), "document", None)
+        if not doc:
+            continue
+        name = None
+        for a in getattr(doc, "attributes", []):
+            if getattr(a, "file_name", None):
+                name = a.file_name
+        if not name:
+            skipped += 1
+            continue
+        token = encode_ref(chat_id, msg.id, ACCOUNT_OLD)
+        await record_in_catalogue(name, doc.size, f"{PUBLIC_BASE}/b/{token}")
+        filed += 1
+    log.info(f"backfill {chat_id}: filed {filed} links, skipped {skipped}")
+    return web.json_response({"chat": chat_id, "filed": filed, "skipped": skipped})
+
+
+def _login_failure(request):
+    """None when the caller may proceed, otherwise the response to send instead."""
+    if STATUS_KEY and hmac.compare_digest(request.query.get("k", ""), STATUS_KEY):
+        return None
+    if STATUS_USER and STATUS_PASS:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Basic "):
+            try:
+                user, _, pwd = base64.b64decode(auth[6:]).decode().partition(":")
+                if (hmac.compare_digest(user, STATUS_USER)
+                        and hmac.compare_digest(pwd, STATUS_PASS)):
+                    return None
+            except Exception:
+                pass
+        return web.Response(status=401, text="login required",
+                            headers={"WWW-Authenticate": 'Basic realm="BookLink"'})
+    return web.Response(status=404, text="not found")
+
+
+_sweep = {"running": False, "done": 0, "total": 0, "checked": 0,
+          "dead": 0, "skipped": 0, "error": ""}
+_sweep_stop = False
+
+
+def _catalogue_refs(chat):
+    """Every distinct (chat, message, account, link) the catalogue knows."""
+    con = sqlite3.connect(f"file:{FILES_DB}?mode=ro", uri=True, timeout=10)
+    try:
+        rows = con.execute("SELECT stored FROM files WHERE stored IS NOT NULL").fetchall()
+    finally:
+        con.close()
+    refs = {}
+    for (stored,) in rows:
+        if not stored or "/b/" not in stored:
+            continue
+        token = stored.rsplit("/b/", 1)[1].split("/")[0].split("?")[0]
+        try:
+            c, m, a = decode_ref(token)
+        except Exception:
+            continue
+        if chat is not None and c != chat:
+            continue
+        refs[(c, m, a)] = stored
+    return [(c, m, a, s) for (c, m, a), s in refs.items()]
+
+
+def _sweep_client(chat_id, account):
+    """Who can read this message: a DM belongs to one account, a group to any."""
+    if chat_id > 0:
+        return own_cli(account)
+    return third_client or client or new_client
+
+
+async def _sweep_run(chat, limit):
+    """Ask Telegram about every catalogue message and record the missing ones.
+
+    Batched 100 ids per call: one request per hundred links instead of one per
+    link, which is the difference between an hour and a week.
+    """
+    refs = await _aio(_catalogue_refs, chat)
+    if limit:
+        refs = refs[:limit]
+    _sweep.update(total=len(refs), checked=0, dead=0, skipped=0, error="")
+    by_chat = {}
+    for c, m, a, s in refs:
+        by_chat.setdefault((c, a), []).append((m, s))
+
+    found_dead = []
+    for (c, a), items in by_chat.items():
+        cli = _sweep_client(c, a)
+        if cli is None:
+            log.info(f"sweep {c}: no account can read it, skipping {len(items)}")
+            _sweep["skipped"] += len(items)
+            continue
+        live_seen = False
+        for i in range(0, len(items), 100):
+            if _sweep_stop:
+                log.info("sweep stopped on request")
+                break
+            chunk = items[i:i + 100]
+            msgs = None
+            for attempt in range(3):
+                try:
+                    msgs = await cli.get_messages(c, ids=[m for m, _ in chunk])
+                    break
+                except FloodWaitError as e:
+                    log.warning(f"sweep {c}: flood wait {e.seconds}s")
+                    await asyncio.sleep(e.seconds + 1)
+                except Exception as e:
+                    log.warning(f"sweep {c}: batch failed ({type(e).__name__}: {e})")
+                    break
+            if msgs is None:
+                _sweep["skipped"] += len(chunk)
+                continue
+            by_id = {m.id: m for m in msgs if m is not None}
+            batch_dead = []
+            for m, stored in chunk:
+                msg = by_id.get(m)
+                if msg is not None and getattr(msg, "media", None):
+                    live_seen = True
+                    _sweep["checked"] += 1
+                else:
+                    batch_dead.append(stored)
+            # A whole batch missing means this account cannot see the chat's
+            # history, not that a hundred consecutive books vanished. Treat it
+            # as unreadable rather than marking good links dead.
+            if not live_seen and len(batch_dead) == len(chunk) and len(chunk) > 5:
+                log.warning(f"sweep {c}: nothing readable — account cannot see history, skipping")
+                _sweep["skipped"] += len(chunk)
+            else:
+                found_dead.extend(batch_dead)
+                _sweep["dead"] += len(batch_dead)
+            # The full catalogue is hours of requests; keep what has been found
+            # so far rather than losing it to a restart.
+            if batch_dead and len(found_dead) % 500 < len(batch_dead):
+                _dead_links.update(found_dead)
+                await _aio(_save_dead_links)
+            await asyncio.sleep(0.4)
+
+    _dead_links.update(found_dead)
+    await _aio(_save_dead_links)
+    log.info(f"sweep finished: {_sweep['checked']} live, {_sweep['dead']} dead, "
+             f"{_sweep['skipped']} skipped")
+    # A dead link is invisible until somebody clicks it. Say it out loud instead,
+    # while there is still a copy somewhere to point it at.
+    if found_dead:
+        try:
+            await _alert(f"BookLink sweep: {len(found_dead)} dead link(s) found and hidden "
+                         f"from search ({_sweep['checked']} checked).")
+        except Exception as e:
+            log.warning(f"dead-link alert failed: {e}")
+
+
+async def handle_sweep(request: web.Request):
+    """Find catalogue links whose Telegram message is gone. Read-only.
+
+    Hidden from search rather than deleted: a dead row is still evidence of a
+    book, and the sweep is meant to be safe to run again and again.
+    """
+    global _sweep_stop
+    failure = _login_failure(request)
+    if failure is not None:
+        return failure
+    if request.query.get("stop"):
+        _sweep_stop = True
+        return web.json_response({"stopping": True, **_sweep})
+    if request.query.get("status") or _sweep["running"]:
+        return web.json_response(_sweep)
+    _sweep_stop = False
+    try:
+        limit = int(request.query.get("limit", 0))
+        chat = request.query.get("chat")
+        chat = int(chat) if chat else None
+    except ValueError:
+        return web.json_response({"error": "limit and chat must be integers"}, status=400)
+
+    _sweep.update(running=True, done=0)
+
+    async def _run():
+        try:
+            await _sweep_run(chat, limit)
+        except Exception as e:
+            log.error(f"sweep failed: {type(e).__name__}: {e}")
+            _sweep["error"] = f"{type(e).__name__}: {e}"
+        finally:
+            _sweep["running"] = False
+            _sweep["done"] = 1
+
+    asyncio.create_task(_run())
+    return web.json_response({"started": True, "chat": chat, "limit": limit})
+
+
+def _norm_name(name: str) -> str:
+    """Filename reduced to its bones: case, spacing, punctuation and extension.
+
+    The catalogue keys on the exact filename, which is why the same book arrives
+    as several rows. For matching a copy against an original, the bones are what
+    matter — and the size check alongside it is what keeps this honest.
+    """
+    s = re.sub(r"\.[a-z0-9]{2,5}$", "", name.lower())
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+
+_recover = {"running": False, "done": 0, "scanned": 0, "matched": 0,
+            "total": 0, "error": "", "chat": None}
+_recover_stop = False
+
+
+def _dm_targets():
+    """Private-chat links whose exact file we still want a group copy of.
+
+    Keyed on (normalised name, size) so a match is the same file rather than a
+    different bitrate of the same book — a repointed link must not quietly hand
+    a reader a worse copy than the one it replaced.
+    """
+    con = sqlite3.connect(f"file:{FILES_DB}?mode=ro", uri=True, timeout=10)
+    try:
+        rows = con.execute("SELECT filename, size, stored FROM files "
+                           "WHERE stored IS NOT NULL").fetchall()
+    finally:
+        con.close()
+    targets = {}
+    for fn, sz, stored in rows:
+        if not stored or "/b/" not in stored:
+            continue
+        token = stored.rsplit("/b/", 1)[1].split("/")[0].split("?")[0]
+        try:
+            chat, _msg, _acct = decode_ref(token)
+        except Exception:
+            continue
+        if chat <= 0 or token in _repoints:      # only private chats, only once
+            continue
+        targets.setdefault((_norm_name(fn), sz), []).append(token)
+    return targets
+
+
+async def _recover_run(chat, limit):
+    """Find each private-chat book's identical copy in a group and repoint to it."""
+    targets = await _aio(_dm_targets)
+    _recover.update(total=sum(len(v) for v in targets.values()),
+                    scanned=0, matched=0, chat=chat, error="")
+    # Deliberately the long-standing account, not the intake one: the sweep runs
+    # on intake, and Telegram's flood budget is per account, so the two jobs can
+    # work at once without stealing each other's allowance.
+    cli = client or third_client or new_client
+    if cli is None:
+        _recover["error"] = "no account can read that chat"
+        return
+    log.info(f"recover: {len(targets)} files wanted, scanning {chat}")
+
+    scanned = 0
+    async for msg in cli.iter_messages(chat, limit=limit or None):
+        if _recover_stop:
+            log.info("recover stopped on request")
+            break
+        scanned += 1
+        if scanned % 200 == 0:
+            _recover["scanned"] = scanned
+        doc = getattr(getattr(msg, "media", None), "document", None)
+        if not doc:
+            continue
+        name = None
+        for a in getattr(doc, "attributes", []):
+            if getattr(a, "file_name", None):
+                name = a.file_name
+        if not name:
+            continue
+        key = (_norm_name(name), doc.size)
+        tokens = targets.pop(key, None)
+        if not tokens:
+            continue
+        new_token = encode_ref(chat, msg.id, ACCOUNT_OLD)
+        for token in tokens:
+            _repoints[token] = new_token
+            _recover["matched"] += 1
+        log.info(f"recover: {name} -> message {msg.id} ({len(tokens)} link(s))")
+        if _recover["matched"] % 200 < len(tokens):
+            await _aio(_save_repoints)
+        if not targets:
+            break
+
+    _recover["scanned"] = scanned
+    await _aio(_save_repoints)
+    log.info(f"recover finished: scanned {scanned}, repointed {_recover['matched']}, "
+             f"{len(targets)} still missing")
+
+
+async def handle_recover(request: web.Request):
+    """Repoint private-chat links at their identical copy in a group. Read-only."""
+    global _recover_stop
+    failure = _login_failure(request)
+    if failure is not None:
+        return failure
+    if request.query.get("stop"):
+        _recover_stop = True
+        return web.json_response({"stopping": True, **_recover})
+    if request.query.get("status") or _recover["running"]:
+        return web.json_response(_recover)
+    try:
+        chat = int(request.query["chat"])
+        limit = int(request.query.get("limit", 0))
+    except (KeyError, ValueError):
+        return web.json_response({"error": "chat (and optional limit) required"}, status=400)
+    _recover_stop = False
+    _recover.update(running=True, done=0)
+
+    async def _run():
+        try:
+            await _recover_run(chat, limit)
+        except Exception as e:
+            log.error(f"recover failed: {type(e).__name__}: {e}")
+            _recover["error"] = f"{type(e).__name__}: {e}"
+        finally:
+            _recover["running"] = False
+            _recover["done"] = 1
+
+    asyncio.create_task(_run())
+    return web.json_response({"started": True, "chat": chat, "limit": limit})
+
+
+_copy = {"running": False, "done": 0, "total": 0, "copied": 0,
+         "skipped": 0, "failed": 0, "error": "", "chat": None}
+_copy_stop = False
+
+
+async def _copy_run(chat, account, limit):
+    """Copy every media message in a chat to the public box, one at a time.
+
+    This is what makes a private-chat link survive its account: once a copy is
+    on the box, /b/ redirects to it and Telegram is never asked again. A group
+    book would be fine without this — any librarian can fetch it — but a DM book
+    has exactly one account that can, and that account is the thing at risk.
+    """
+    cli = _account_client("1" if account == ACCOUNT_NEW else "0")
+    if cli is None:
+        _copy["error"] = "that account is not available"
+        return
+    items = []
+    async for m in cli.iter_messages(chat, limit=limit or None):
+        doc = getattr(getattr(m, "media", None), "document", None)
+        if not doc:
+            continue
+        name = None
+        for a in getattr(doc, "attributes", []):
+            if getattr(a, "file_name", None):
+                name = a.file_name
+        items.append((m.id, name or f"file_{m.id}.bin"))
+    _copy.update(total=len(items), done=0, copied=0, skipped=0, failed=0, chat=chat)
+    log.info(f"copy: {len(items)} files from {chat}")
+
+    for message_id, name in items:
+        if _copy_stop:
+            log.info("copy stopped on request")
+            break
+        key = _offload_key(chat, message_id, account)
+        if _ultra_live(key):
+            _copy["skipped"] += 1
+            _copy["done"] += 1
+            continue
+        try:
+            cache_file = cache_path(chat, message_id, account)
+            if not await _aio(cache_file.is_file):
+                msg, used = await get_media_message(chat, message_id, cli)
+                if msg is None:
+                    _copy["failed"] += 1
+                    _copy["done"] += 1
+                    continue
+                await download_to_cache(chat, message_id, msg, used, account)
+            await ultra_offload_task(key, chat, message_id, account,
+                                     cache_file, name, high=False)
+            _copy["copied"] += 1
+        except Exception as e:
+            log.warning(f"copy failed for {key}: {type(e).__name__}: {e}")
+            _copy["failed"] += 1
+        _copy["done"] += 1
+
+    log.info(f"copy finished: {_copy['copied']} copied, {_copy['skipped']} already there, "
+             f"{_copy['failed']} failed")
+
+
+async def handle_copy(request: web.Request):
+    """Copy a chat's books to the public box so their links outlive the account."""
+    global _copy_stop
+    failure = _login_failure(request)
+    if failure is not None:
+        return failure
+    if request.query.get("stop"):
+        _copy_stop = True
+        return web.json_response({"stopping": True, **_copy})
+    if request.query.get("status") or _copy["running"]:
+        return web.json_response(_copy)
+    try:
+        chat = int(request.query["chat"])
+        account = int(request.query.get("account", ACCOUNT_NEW))
+        limit = int(request.query.get("limit", 0))
+    except (KeyError, ValueError):
+        return web.json_response({"error": "chat required; account and limit optional"}, status=400)
+    _copy_stop = False
+    _copy.update(running=True)
+
+    async def _run():
+        try:
+            await _copy_run(chat, account, limit)
+        finally:
+            _copy["running"] = False
+
+    asyncio.create_task(_run())
+    return web.json_response({"started": True, "chat": chat, "account": account})
+
+
+def _account_client(which: str):
+    return {"1": new_client, "0": client, "third": third_client}.get(which)
+
+
+async def handle_dialogs(request: web.Request):
+    """List an account's private chats — who has sent it books."""
+    failure = _login_failure(request)
+    if failure is not None:
+        return failure
+    cli = _account_client(request.query.get("account", "1"))
+    if cli is None:
+        return web.json_response({"error": "that account is not available"}, status=503)
+    out = []
+    async for d in cli.iter_dialogs():
+        if not d.is_user:
+            continue
+        out.append({"id": d.id, "name": d.name,
+                    "username": getattr(d.entity, "username", None)})
+    return web.json_response(out)
+
+
+async def handle_audit(request: web.Request):
+    """Every media message in one chat, as (id, name, size, date)."""
+    failure = _login_failure(request)
+    if failure is not None:
+        return failure
+    try:
+        chat = int(request.query["chat"])
+        limit = int(request.query.get("limit", 0))
+    except (KeyError, ValueError):
+        return web.json_response({"error": "chat (and optional limit) required"}, status=400)
+    cli = _account_client(request.query.get("account", "1")) or client
+    if cli is None:
+        return web.json_response({"error": "no account available"}, status=503)
+    out = []
+    try:
+        async for m in cli.iter_messages(chat, limit=limit or None):
+            doc = getattr(getattr(m, "media", None), "document", None)
+            if not doc:
+                continue
+            name = None
+            for a in getattr(doc, "attributes", []):
+                if getattr(a, "file_name", None):
+                    name = a.file_name
+            out.append({"id": m.id, "name": name, "size": doc.size, "date": str(m.date)})
+    except Exception as e:
+        return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=502)
+    return web.json_response(out)
+
+
+async def handle_inspect(request: web.Request):
+    """What a catalogue message actually is — read-only, for diagnosing links.
+
+    Used to answer "where did this book come from" without downloading it: a
+    forwarded copy carries the chat it came from, which is how a link minted off
+    a copy can be traced back to the original post.
+    """
+    failure = _login_failure(request)
+    if failure is not None:
+        return failure
+    try:
+        chat = int(request.query["chat"])
+        ids = [int(x) for x in request.query["ids"].split(",")][:100]
+    except (KeyError, ValueError):
+        return web.json_response({"error": "chat and ids (comma separated) required"}, status=400)
+    cli = _sweep_client(chat, ACCOUNT_NEW)
+    if cli is None:
+        return web.json_response({"error": "no account can read that chat"}, status=503)
+    try:
+        msgs = await cli.get_messages(chat, ids=ids)
+    except Exception as e:
+        return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=502)
+    out = []
+    for m in msgs:
+        if m is None:
+            out.append(None)
+            continue
+        fwd = getattr(m, "fwd_from", None)
+        doc = getattr(getattr(m, "media", None), "document", None)
+        name = None
+        for a in getattr(doc, "attributes", []) if doc else []:
+            if getattr(a, "file_name", None):
+                name = a.file_name
+        out.append({
+            "id": m.id,
+            "date": str(getattr(m, "date", "")),
+            "media": bool(m.media),
+            "name": name,
+            "size": getattr(doc, "size", None),
+            "forwarded_from": str(fwd) if fwd is not None else None,
+        })
+    return web.json_response(out)
+
+
+async def handle_books_proxy(request: web.Request):
+    """Stream a public copy from the box, adding its credentials on the way.
+
+    The box's provider enforces HTTP auth that the account cannot change, so a
+    reader given its URL directly would get a password prompt. Here the service
+    holds the credentials and passes the bytes through, which keeps the URL a
+    reader sees on our own domain and keeps the password out of every link.
+    """
+    global _box_session
+    if not BOX_PROXY_BASE:
+        return web.Response(status=404, text="not found")
+    if _box_session is None or _box_session.closed:
+        # Bounded on purpose. Phone players abort and restart range requests
+        # constantly, and each abandoned stream used to leave an upstream
+        # connection held open until its read timeout — which is how a burst of
+        # ordinary listening starved the pool and took the service with it.
+        _box_session = aiohttp.ClientSession(
+            auth=aiohttp.BasicAuth(BOX_PROXY_USER, BOX_PROXY_PASS),
+            # force_close: never pool connections to the box. Aborted downloads
+            # left half-dead ones in the pool, and a pool full of those stops
+            # serving entirely — 25 of them, some idle 30 hours, took every link
+            # down. One connection per request costs nothing by comparison.
+            connector=aiohttp.TCPConnector(limit=24, limit_per_host=24, force_close=True),
+            timeout=aiohttp.ClientTimeout(total=1800, sock_connect=20, sock_read=120),
+        )
+    name = request.match_info.get("path", "")
+    url = f"{BOX_PROXY_BASE}/books/{quote(name)}"
+    fwd = {}
+    if request.headers.get("Range"):
+        fwd["Range"] = request.headers["Range"]
+    try:
+        upstream = await _box_session.get(url, headers=fwd)
+    except Exception as e:
+        log.warning(f"book proxy failed for {name}: {type(e).__name__}: {e}")
+        return web.Response(status=502, text="box unreachable")
+    if upstream.status >= 400:
+        upstream.release()
+        return web.Response(status=upstream.status, text="not found")
+
+    headers = {}
+    for h in ("Content-Type", "Content-Length", "Content-Range",
+              "Accept-Ranges", "Last-Modified"):
+        if upstream.headers.get(h):
+            headers[h] = upstream.headers[h]
+    headers["Content-Disposition"] = f'attachment; filename="{Path(name).name}"'
+    headers["Access-Control-Allow-Origin"] = "*"
+    if request.method == "HEAD":
+        upstream.release()
+        return web.Response(status=upstream.status, headers=headers)
+
+    resp = web.StreamResponse(status=upstream.status, headers=headers)
+    await resp.prepare(request)
+    try:
+        async for chunk in upstream.content.iter_chunked(256 * 1024):
+            await resp.write(chunk)
+    except Exception as e:
+        # A reader that walked away mid-download: drop the upstream connection
+        # outright rather than handing a half-read one back to the pool.
+        log.warning(f"book proxy stream broke for {name}: {type(e).__name__}: {e}")
+        upstream.close()
+    else:
+        upstream.release()
+    return resp
+
+
+
+async def handle_whoami(request: web.Request):
+    """Which account each client is actually logged in as."""
+    failure = _login_failure(request)
+    if failure is not None:
+        return failure
+    out = {}
+    for label, cli in (("old", client), ("new", new_client), ("third", third_client)):
+        if cli is None:
+            out[label] = None
+            continue
+        try:
+            me = await cli.get_me()
+            out[label] = {"id": me.id, "username": me.username, "name": me.first_name,
+                          "premium": bool(getattr(me, "premium", False))}
+        except Exception as e:
+            out[label] = {"error": f"{type(e).__name__}: {e}"}
+    return web.json_response(out)
 
 
 async def handle_status(request: web.Request):
@@ -1259,6 +2247,16 @@ async def handle_status(request: web.Request):
     if query and FILES_DB and Path(FILES_DB).exists():
         matches = await asyncio.get_running_loop().run_in_executor(
             None, _catalogue_query, query)
+
+    # What has been filed lately, copy or no copy. Posting a book to a room is
+    # how Cerina gets its link — she never opens the links afterwards — so a list
+    # that only shows copies hides every book she just posted.
+    recent = []
+    if FILES_DB and Path(FILES_DB).exists():
+        try:
+            recent = await asyncio.get_running_loop().run_in_executor(None, _recent_filed)
+        except Exception as e:
+            log.warning(f"recent-filed list failed: {e}")
 
     ready, pending = [], []
     for key, ent in _ultra_map.items():
@@ -1328,7 +2326,7 @@ async def handle_status(request: web.Request):
             "</tr>"
         )
 
-    disk = await _box_disk()
+    disk = _box_disk()
     body = f"""<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>BookLink &middot; public copies</title>
@@ -1389,6 +2387,17 @@ it just has no copy on the box, so a reader waits for it to come off Telegram.</
 </tr></thead>
 <tbody>{''.join(match_row(*m) for m in matches) or '<tr><td colspan=5 class=dim>nothing matched</td></tr>'}</tbody></table>
 ''') if query else ''}
+<h2 class=mt>Recently filed</h2>
+<div class=sub>The last {len(recent)} books that got a link, newest first &mdash; whether or not a copy
+is on the box. This is the list to read after posting.</div>
+<table id=recent><thead><tr>
+ <th data-k=name>Name</th>
+ <th data-k=size style="text-align:right">Size</th>
+ <th>Copy</th>
+ <th data-k=added>Filed</th>
+ <th>Link</th>
+</tr></thead>
+<tbody>{''.join(match_row(*r) for r in recent) or '<tr><td colspan=5 class=dim>nothing filed yet</td></tr>'}</tbody></table>
 <h2 class=mt>Copies on the box</h2>
 <table id=copies><thead><tr>
  <th data-k=name>Name</th>
@@ -1436,6 +2445,33 @@ for (const tb of document.querySelectorAll("table[id] tbody")) {{
     return resp
 
 
+async def _reply_in_chat(cli, event, text, **kw):
+    """Reply to the book, healing the two ways a librarian's reply fails.
+
+    1. The peer isn't in the entity cache. StringSession keeps no access hashes
+       across a restart, and `_warm_entities` only knows the dialogs that existed
+       at startup, so a room joined later delivers a message the client can
+       receive but cannot address. Re-reading the dialog list once caches it.
+    2. The receiving account cannot send at all — a read-only or frozen account
+       still *reads* (which is why existing links keep serving) but every reply
+       is refused, so no new link would ever be minted. A group message can be
+       answered by either librarian, so fall back to the other one rather than
+       losing the link. A DM cannot: its message ids are per-account.
+    """
+    try:
+        return await event.reply(text, **kw)
+    except Exception as e:
+        log.warning(f"reply to {event.chat_id} failed ({type(e).__name__}: {e})")
+        alt = other_cli(cli) if event.chat_id < 0 else None
+        if alt is None:
+            raise
+        if isinstance(e, PeerIdInvalidError):
+            await _warm_entities(cli)
+        log.info(f"replying to {event.chat_id} from the other librarian instead")
+        return await alt.send_message(event.chat_id, text,
+                                      reply_to=event.message.id, **kw)
+
+
 async def on_forwarded_book(event):
     """Forward any book to a librarian account → get its permanent link back.
 
@@ -1465,12 +2501,17 @@ async def on_forwarded_book(event):
             if LINK_SECRET:
                 link += f"?s={sign(token)}"
         size_mb = doc.size / 1024 / 1024
-        await event.reply(
-            f"📚 {name or 'file'}\n{size_mb:.1f} MB\n\n"
-            f"🔗 Permanent link:\n{link}\n\n"
-            f"📋 Easy copy (tap to copy):\n`{link}`",
-            link_preview=False,
-        )
+        # A room can want the link without the post. The link is the deliverable
+        # and it is filed below either way; the reply is the part that is noise
+        # in a room people scroll.
+        if event.chat_id not in SILENT_CHATS:
+            await _reply_in_chat(
+                cli, event,
+                f"📚 {name or 'file'}\n{size_mb:.1f} MB\n\n"
+                f"🔗 Permanent link:\n{link}\n\n"
+                f"📋 Easy copy (tap to copy):\n`{link}`",
+                link_preview=False,
+            )
         # Group books (notifier forwards from the watched group) get a link only — no
         # precache. They're a list/database for the ABB, not hot public links, so
         # pre-downloading them just burns Telegram bandwidth and evicts real singles.
@@ -1490,13 +2531,20 @@ async def on_forwarded_book(event):
                 asyncio.create_task(warm_reused_link(reuse))
             else:
                 asyncio.create_task(precache_in_background(event.chat_id, event.message.id, event.message, cli, account))
+        note_mint()
         log.info(
             f"link {'reused' if reuse else 'issued'} for {name} "
             f"({event.chat_id}/{event.message.id}, account {account}, group={is_group_forward})"
+            f"{' [silent: filed, no reply]' if event.chat_id in SILENT_CHATS else ''}"
         )
     except Exception as e:
         log.error(f"link handler error: {e}")
-        await event.reply(f"couldn't make a link: {e}")
+        try:
+            await _reply_in_chat(event.client, event, f"couldn't make a link: {e}")
+        except Exception as e2:
+            # The reply itself can fail for the same reason the link did; say so
+            # in the log rather than raising out of the handler.
+            log.error(f"could not even report that failure to {event.chat_id}: {e2}")
 
 
 _seen_unlisted_groups = set()
@@ -1518,23 +2566,88 @@ async def on_unlisted_group_media(event):
     )
 
 
+async def _pick_intake_client():
+    """The librarian that should handle shared group chats.
+
+    A frozen account still reads — which is why the links it minted keep serving —
+    but Telegram refuses its action methods (GetParticipants and friends) and
+    stops delivering group updates to it, so it can neither see a group post nor
+    answer one. Pick the account that can actually act instead of assuming.
+    """
+    probe = min(INTAKE_CHATS) if INTAKE_CHATS else None
+    for cli, label in ((third_client, "@Little Darling"),
+                       (new_client, "@lightweavebooks"),
+                       (client, "@Cerina2")):
+        if cli is None:
+            continue
+        try:
+            if probe is not None:
+                await cli.get_participants(probe, limit=1)
+            return cli, label
+        except Exception as e:
+            log.warning(f"intake probe failed on {label}: {type(e).__name__}: {e}")
+    return None, None
+
+
+async def _start_or_drop(attr):
+    """Start one librarian; if Telegram refuses it, log it and carry on.
+
+    A deleted account's session raises out of start() — AuthKeyUnregistered, or
+    UserDeactivated. Letting that propagate takes the whole service down, so one
+    dead account would silence all three and every link would 404 at once. The
+    accounts are independent: whichever ones still log in serve what they can,
+    and a group link whose token names the missing account still recovers through
+    the other one (see get_media_message).
+    """
+    cli = globals()[attr]
+    if cli is None:
+        return
+    try:
+        await cli.start()
+    except Exception as e:
+        log.error(f"{attr} could not start ({type(e).__name__}: {e}) — continuing without it")
+        globals()[attr] = None
+
+
 async def on_startup(app):
     _ultra_load()
+    _load_dead_links()
+    _load_repoints()
     await client.start()
+    await _start_or_drop("new_client")
+    await _start_or_drop("third_client")
+    if third_client is not None:
+        # Cache its dialogs before the intake probe runs, or a group it has just
+        # joined is still unresolvable by numeric id and the probe wrongly fails.
+        await _warm_entities(third_client)
+
+    # Private chats: each account answers its own, because a DM's message ids
+    # belong to the account that received it and neither can see the other's.
     client.add_event_handler(
         on_forwarded_book,
         events.NewMessage(incoming=True, func=lambda e: e.is_private and e.media),
     )
     if new_client is not None:
-        await new_client.start()
         new_client.add_event_handler(
+            on_forwarded_book,
+            events.NewMessage(incoming=True, func=lambda e: e.is_private and e.media),
+        )
+
+    # Groups are shared, so exactly one account handles them — and it has to be
+    # one that can still act (see _pick_intake_client).
+    intake_cli, intake_label = await _pick_intake_client()
+    if intake_cli is None:
+        log.error("no librarian can act on group chats — group posts will mint nothing")
+    else:
+        log.info(f"group intake handled by {intake_label}")
+        intake_cli.add_event_handler(
             on_forwarded_book,
             events.NewMessage(
                 incoming=True,
-                func=lambda e: e.media and (e.is_private or e.chat_id in INTAKE_CHATS),
+                func=lambda e: e.media and not e.is_private and e.chat_id in INTAKE_CHATS,
             ),
         )
-        new_client.add_event_handler(
+        intake_cli.add_event_handler(
             on_unlisted_group_media,
             events.NewMessage(
                 incoming=True,
@@ -1544,7 +2657,9 @@ async def on_startup(app):
     asyncio.create_task(ultra_save_loop())
     asyncio.create_task(cache_cleanup_loop())
     asyncio.create_task(disk_alert_loop())
+    asyncio.create_task(box_disk_loop())
     asyncio.create_task(premium_watch_loop())
+    asyncio.create_task(intake_watchdog_loop())
     await resolve_download_account(initial=True)
     flags = await _premium_flags()
     log.info(
@@ -1569,7 +2684,16 @@ def build_app():
     # Pretty form: /b/<key>/Any Book Name.m4b  — the name is cosmetic, the key does the work
     app.router.add_get("/b/{token}/{name:.*}", handle_book)
     app.router.add_get("/d/{code}", handle_download)
+    app.router.add_get("/books/{path:.*}", handle_books_proxy)
+    app.router.add_get("/whoami", handle_whoami)
     app.router.add_get("/status", handle_status)
+    app.router.add_get("/backfill", handle_backfill)
+    app.router.add_get("/sweep", handle_sweep)
+    app.router.add_get("/inspect", handle_inspect)
+    app.router.add_get("/dialogs", handle_dialogs)
+    app.router.add_get("/audit", handle_audit)
+    app.router.add_get("/copy", handle_copy)
+    app.router.add_get("/recover", handle_recover)
     app.on_startup.append(on_startup)
     return app
 
