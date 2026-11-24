@@ -443,3 +443,10 @@ breakage. Failures log and move on.
 ## Licence
 
 MIT — see [LICENSE](LICENSE).
+
+
+## Credits
+
+**Built on [telegram2FileCodeBox](https://github.com/Heavrnl/telegram2FileCodeBox)**
+by **Heavrnl** (MIT) — the file-link engine beneath BookLink's permanent links.
+Thank you! 💜
